@@ -9,7 +9,10 @@ import fs from 'fs';
 import os from 'os';
 import { execSync, exec } from 'child_process';
 import chalk from 'chalk';
+import 'dotenv/config';
+import { fileURLToPath } from 'url';
 import { isAgentAvailable } from '../server/pty_manager.js';
+import { syncWorkspaceFromHost } from '../server/sync.js';
 
 const brandTurf = chalk.hex('#BBE15A').bold;
 const brandCode = chalk.hex('#FFFFFF').bold;
@@ -23,6 +26,7 @@ process.on('uncaughtException', (err) => {
     const logLine = `[${new Date().toISOString()}] Uncaught Exception: ${err.stack || err}\n`;
     fs.appendFileSync(path.join(process.cwd(), 'turf-error.log'), logLine);
   } catch (e) {}
+  console.error('\n❌ Uncaught error:', err);
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -30,6 +34,7 @@ process.on('unhandledRejection', (reason) => {
     const logLine = `[${new Date().toISOString()}] Unhandled Rejection: ${reason && (reason.stack || reason)}\n`;
     fs.appendFileSync(path.join(process.cwd(), 'turf-error.log'), logLine);
   } catch (e) {}
+  console.error('\n❌ Unhandled rejection:', reason);
 });
 
 let rl = readline.createInterface({
@@ -182,7 +187,8 @@ async function prompt(question) {
     };
     const onData = (data) => {
       const s = data.toString();
-      if (s === '\x1b' || s.startsWith('\x1b')) {
+      // ponytail: lone ESC only — focus/mouse/arrow sequences (\x1b[.., \x1bO..) must not bounce to start
+      if (s === '\x1b') {
         cleanup();
         resetRl();
         resolved = true;
@@ -214,8 +220,9 @@ async function prompt(question) {
 async function normalizeAndValidatePath(input, promptFn, pad = '') {
   while (true) {
     if (input === '__BACK__') return '__BACK__';
-    let clean = input || '.';
+    let clean = (input || '.').trim();
     clean = clean.replace(/^(&\s*)?["']|["']$/g, '').trim();
+    clean = clean.replace(/^["']|["']$/g, '').trim();
     if (clean.toLowerCase() === 'back' || clean.toLowerCase() === 'b' || clean.toLowerCase() === 'esc') {
       return '__BACK__';
     }
@@ -285,7 +292,133 @@ async function normalizeAndValidatePath(input, promptFn, pad = '') {
   }
 }
 
+// LLM providers the Turf agent can call (env names per Pi provider docs).
+const TURF_PROVIDERS = [
+  { label: 'Google Gemini Studio (FREE tier - 1,000,000 TPM - Recommended)', env: 'GEMINI_API_KEY' },
+  { label: 'Groq (FREE tier - 20,000 TPM)', env: 'GROQ_API_KEY' },
+  { label: 'Anthropic', env: 'ANTHROPIC_API_KEY' },
+  { label: 'OpenAI', env: 'OPENAI_API_KEY' },
+  { label: 'DeepSeek', env: 'DEEPSEEK_API_KEY' },
+  { label: 'OpenRouter', env: 'OPENROUTER_API_KEY' },
+  { label: 'Cerebras (free tier)', env: 'CEREBRAS_API_KEY' }
+];
+
+// ponytail: session env + gitignored .env write, no keyring abstractions
+const TURF_KEY_MARKER = path.join(os.homedir(), '.turf', 'key-setup-done');
+
+function hasAnyConfiguredKey(destDir) {
+  const envFile = path.join(destDir || process.cwd(), '.env');
+  let envContent = '';
+  try {
+    if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+  } catch {}
+  return TURF_PROVIDERS.some((p) => (process.env[p.env] && process.env[p.env].trim()) || new RegExp(`^${p.env}=.+`, 'm').test(envContent));
+}
+
+function keySetupDone() {
+  return hasAnyConfiguredKey(process.cwd());
+}
+
+function markKeySetupDone() {
+  try {
+    fs.mkdirSync(path.dirname(TURF_KEY_MARKER), { recursive: true });
+    fs.writeFileSync(TURF_KEY_MARKER, new Date().toISOString(), 'utf8');
+  } catch {}
+}
+
+async function setupTurfApiKey(promptFn, pad, destDir, force = false) {
+  const envFile = path.join(destDir || process.cwd(), '.env');
+  let envContent = '';
+  try {
+    if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+  } catch {}
+
+  const hasKey = hasAnyConfiguredKey(destDir);
+  if (!force && hasKey) {
+    const askMore = await promptFn('\n' + pad + accent('›') + ' ' + bright('API key already configured. Do you want to add more keys?') + dim(' [y/N]: '));
+    if (askMore === '__BACK__') return '__BACK__';
+    if (askMore.toLowerCase() !== 'y' && askMore.toLowerCase() !== 'yes') {
+      return 'skipped';
+    }
+  }
+
+  const finish = (res) => { markKeySetupDone(); return res; };
+
+  while (true) {
+    try {
+      if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+    } catch {}
+
+    console.log('\n' + pad + bright('Turf agent LLM key') + ' ' + dim('(BYOK — saved to .env, never git)'));
+    TURF_PROVIDERS.forEach((p, i) => {
+      const isConfigured = !!(process.env[p.env] && process.env[p.env].trim()) || new RegExp(`^${p.env}=.+`, 'm').test(envContent);
+      const tag = isConfigured ? chalk.green(' [Configured]') : '';
+      console.log(pad + '  ' + brandTurf(`[${i + 1}]`) + ' ' + p.label + tag);
+    });
+    console.log(pad + '  ' + dim(`[${TURF_PROVIDERS.length + 1}] Done / Skip`));
+
+    const choice = await promptFn(pad + accent('›') + ' ' + bright('Pick a provider') + dim(` [1-${TURF_PROVIDERS.length + 1}]: `));
+    if (choice === '__BACK__') return '__BACK__';
+    const idx = parseInt(choice, 10);
+    if (!idx || idx < 1 || idx > TURF_PROVIDERS.length + 1 || idx === TURF_PROVIDERS.length + 1) {
+      return finish('skipped');
+    }
+
+    const provider = TURF_PROVIDERS[idx - 1];
+    const key = await promptFn(pad + accent('›') + ' ' + bright(`Paste ${provider.env}`) + ' ' + dim('(input visible, Enter to save): '));
+    if (key === '__BACK__') return '__BACK__';
+    if (!key.trim()) continue;
+
+    const trimmedKey = key.trim();
+    process.env[provider.env] = trimmedKey;
+
+    try {
+      let content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
+      if (!content.endsWith('\n') && content.length > 0) content += '\n';
+
+      if (provider.env === 'GROQ_API_KEY') {
+        const existingGroq = process.env.GROQ_API_KEY;
+        if (existingGroq && existingGroq !== trimmedKey) {
+          let keysList = process.env.GROQ_API_KEYS ? process.env.GROQ_API_KEYS.split(',').map(k => k.trim()).filter(Boolean) : [existingGroq];
+          if (!keysList.includes(trimmedKey)) keysList.push(trimmedKey);
+          const keysStr = keysList.join(',');
+          process.env.GROQ_API_KEYS = keysStr;
+          const multiRe = /^GROQ_API_KEYS=.*$/m;
+          content = multiRe.test(content)
+            ? content.replace(multiRe, `GROQ_API_KEYS=${keysStr}`)
+            : content + `GROQ_API_KEYS=${keysStr}\n`;
+        }
+      }
+
+      const lineRe = new RegExp(`^${provider.env}=.*$`, 'm');
+      content = lineRe.test(content)
+        ? content.replace(lineRe, `${provider.env}=${trimmedKey}`)
+        : content + `${provider.env}=${trimmedKey}\n`;
+
+      fs.writeFileSync(envFile, content, 'utf8');
+      console.log(pad + accent('●') + ' ' + dim(`Saved ${provider.env} to ${envFile}`));
+    } catch (err) {
+      console.log(pad + dim(`(session-only: could not write .env — ${err.message})`));
+    }
+
+    const another = await promptFn(pad + accent('›') + ' ' + bright('Do you want to add another key?') + dim(' [y/N]: '));
+    if (another === '__BACK__') return finish(provider.env);
+    if (another.toLowerCase() !== 'y' && another.toLowerCase() !== 'yes') {
+      return finish(provider.env);
+    }
+  }
+}
+
 async function main() {
+  if (args.includes('--key')) {
+    // On-demand key setup (onboarding asks only once ever)
+    const pad = getBlockPad(58);
+    const res = await setupTurfApiKey((q) => prompt(q), pad, process.cwd(), true);
+    console.log(res === '__BACK__' ? 'Cancelled.' : res === 'skipped' ? 'No changes.' : `Active: ${res} (restart Turf to apply)`);
+    rl.close();
+    process.exit(0);
+  }
+
   if (args.includes('kill') || args.includes('stop') || args.includes('clean') || args.includes('--kill')) {
     rl.close();
     console.log('Killing any stale Turfcode process on port 7873...');
@@ -332,8 +465,22 @@ async function main() {
       hostIp = parts[0];
       targetPort = parseInt(parts[1], 10);
     }
+    let detectedRoomCode = 'SYNC';
+    try {
+      const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(3000) });
+      if (roomRes.ok) {
+        const meta = await roomRes.json();
+        if (meta && meta.code) detectedRoomCode = meta.code;
+      }
+    } catch (e) {}
+    let peerRepoPath = path.join(os.homedir(), '.turf', 'rooms', detectedRoomCode, 'repo');
+    try {
+      await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath);
+    } catch (e) {
+      peerRepoPath = process.cwd();
+    }
     cleanupStdinForBlessed();
-    launchTUI({ hostName: flags.name || 'Peer', roomCode: 'TRF-XXXX', repoPath: 'Remote Sync', port: targetPort, hostAddress: hostIp, isPeer: true });
+    launchTUI({ hostName: flags.name || 'Peer', roomCode: detectedRoomCode, repoPath: peerRepoPath, port: targetPort, hostAddress: hostIp, isPeer: true });
     return;
   }
 
@@ -361,11 +508,23 @@ async function main() {
       if (repoPathInput === '__BACK__') continue;
       const targetPath = await normalizeAndValidatePath(repoPathInput, (q) => prompt(q), pad);
       if (targetPath === '__BACK__') continue;
+
+      const keyRes = await setupTurfApiKey((q) => prompt(q), pad, targetPath);
+      if (keyRes === '__BACK__') continue;
       
       console.log('\n' + pad + accent('●') + ' ' + dim(`Starting daemon on port ${flags.port}...`));
       const daemon = await spawnHostDaemon({ hostName, repoPath: targetPath, port: flags.port, tunnel: flags.tunnel, forceKill: flags.forceKill });
       cleanupStdinForBlessed();
-      launchTUI({ hostName, roomCode: daemon.room.code, repoPath: targetPath, port: daemon.port, localIp: getLocalIp(), hostAddress: '127.0.0.1', isPeer: false, serverInstance: daemon.server, wssInstance: daemon.wss, detectedAgents: detectInstalledAgents() });
+      try {
+        launchTUI({ hostName, roomCode: daemon.room.code, repoPath: targetPath, port: daemon.port, localIp: getLocalIp(), hostAddress: '127.0.0.1', isPeer: false, serverInstance: daemon.server, wssInstance: daemon.wss, detectedAgents: detectInstalledAgents() });
+      } catch (err) {
+        process.stdout.write('\x1b[?1049l\x1b[?25h');
+        console.error('\n❌ Fatal error launching Turf TUI:', err);
+        try {
+          fs.appendFileSync(path.join(targetPath, 'turf-error.log'), `[TUI Launch Error] ${err.stack || err}\n`);
+        } catch (e) {}
+        process.exit(1);
+      }
       break;
     } else if (option === '2') {
       printSetupHeader('Join Collaborative Session', '— Connect to a team room');
@@ -382,17 +541,51 @@ async function main() {
       const userNameInput = await prompt(pad + accent('›') + ' ' + bright('Enter your name') + dim(` [default: ${defaultPeer}]: `));
       if (userNameInput === '__BACK__') continue;
       const userName = userNameInput.trim() || defaultPeer;
+
+      const keyRes = await setupTurfApiKey((q) => prompt(q), pad, process.cwd());
+      if (keyRes === '__BACK__') continue;
       
-      console.log('\n' + pad + accent('●') + ' ' + dim(`Connecting to ${hostIp}:${targetPort}...`));
+      console.log('\n' + pad + accent('●') + ' ' + dim(`Synchronizing repository from ${hostIp}:${targetPort}...`));
+      let detectedRoomCode = 'SYNC';
+      try {
+        const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(3000) });
+        if (roomRes.ok) {
+          const meta = await roomRes.json();
+          if (meta && meta.code) detectedRoomCode = meta.code;
+        }
+      } catch (e) {}
+      let peerRepoPath = path.join(os.homedir(), '.turf', 'rooms', detectedRoomCode, 'repo');
+      try {
+        await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath);
+        console.log(pad + accent('✓') + ' ' + dim(`Workspace synchronized at ${peerRepoPath}`));
+      } catch (e) {
+        peerRepoPath = process.cwd();
+      }
       cleanupStdinForBlessed();
-      launchTUI({ hostName: userName, roomCode: 'SYNC', repoPath: 'Remote Sync', port: targetPort, hostAddress: hostIp, isPeer: true, detectedAgents: detectInstalledAgents() });
+      try {
+        launchTUI({ hostName: userName, roomCode: detectedRoomCode, repoPath: peerRepoPath, port: targetPort, hostAddress: hostIp, isPeer: true, detectedAgents: detectInstalledAgents() });
+      } catch (err) {
+        process.stdout.write('\x1b[?1049l\x1b[?25h');
+        console.error('\n❌ Fatal error connecting to session:', err);
+        process.exit(1);
+      }
       break;
     }
   }
 }
 
-main().catch(err => {
-  process.stdout.write('\x1b[?1049l\x1b[?25h');
-  console.error('Turfcode Startup Error:', err);
-  process.exit(1);
-});
+const isMain = process.argv[1] && (
+  process.argv[1] === fileURLToPath(import.meta.url) ||
+  process.argv[1].endsWith('turf.js') ||
+  process.argv[1].endsWith('turf')
+);
+
+if (isMain) {
+  main().catch(err => {
+    process.stdout.write('\x1b[?1049l\x1b[?25h');
+    console.error('Turfcode Startup Error:', err);
+    process.exit(1);
+  });
+}
+
+export { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS };

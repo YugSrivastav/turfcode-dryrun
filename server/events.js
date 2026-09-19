@@ -1,8 +1,31 @@
+import { lockRegistry } from './locks.js';
+
 export function handleEvent(ws, wss, room, data) {
   if (data.type === 'ping') {
     if (data.peerId) {
       room.updatePing(data.peerId);
     }
+    return;
+  }
+
+  if (data.type === 'lock:heartbeat') {
+    lockRegistry.heartbeat(data.agentId || data.user);
+    return;
+  }
+
+  if (data.type === 'file:sync') {
+    const msgString = JSON.stringify({
+      type: 'file:sync',
+      origin: data.origin,
+      relPath: data.relPath,
+      content: data.content,
+      timestamp: Date.now()
+    });
+    wss.clients.forEach(client => {
+      if (client !== ws && client.readyState === 1) {
+        client.send(msgString);
+      }
+    });
     return;
   }
   
@@ -31,6 +54,28 @@ export function handleEvent(ws, wss, room, data) {
     return;
   }
 
+  if (data.type === 'agent:negotiate') {
+    broadcast(wss, {
+      type: 'agent:negotiate',
+      fromUser: data.fromUser || 'Host',
+      fromAgent: data.fromAgent || 'turf',
+      toUser: data.toUser || 'All',
+      toAgent: data.toAgent || 'cmdc',
+      file: data.file,
+      intent: data.intent || 'request_lock',
+      message: sanitizeSecrets(data.message),
+      timestamp: Date.now()
+    });
+    broadcast(wss, {
+      type: 'chat:message',
+      user: `🤖 [${(data.fromAgent || 'agent').toUpperCase()}]`,
+      message: sanitizeSecrets(data.message),
+      timestamp: Date.now(),
+      isAgentNegotiation: true
+    });
+    return;
+  }
+
   if (data.type === 'agent:status') {
     broadcast(wss, {
       type: 'agent:status',
@@ -39,6 +84,30 @@ export function handleEvent(ws, wss, room, data) {
       status: data.status,
       details: data.details || '',
       task: data.task || '',
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  if (data.type === 'peacemaker:diff') {
+    broadcast(wss, {
+      type: 'peacemaker:diff',
+      file: data.file,
+      agentA: data.agentA,
+      agentB: data.agentB,
+      merged: data.merged,
+      astAudit: data.astAudit || { passed: true },
+      timestamp: Date.now()
+    });
+    return;
+  }
+
+  if (data.type === 'agent:msg') {
+    broadcast(wss, {
+      type: 'agent:msg',
+      tabId: data.tabId,
+      agent: data.agent,
+      message: sanitizeSecrets(data.message),
       timestamp: Date.now()
     });
     return;

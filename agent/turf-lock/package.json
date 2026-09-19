@@ -1,0 +1,10 @@
+{
+  "name": "turf-lock",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Turf intent-lock Pi extension: declares file locks before write/edit, forks to worktree on conflict",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

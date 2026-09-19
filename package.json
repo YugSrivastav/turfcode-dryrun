@@ -1,16 +1,50 @@
 {
   "name": "turfcode",
   "version": "1.0.0",
+  "description": "Real-Time Intent Network & Collaborative Engine for Multi-Agent Software Development",
   "type": "module",
+  "main": "server/index.js",
   "bin": {
-    "turfcode": "./bin/turf.js"
+    "turfcode": "./bin/turf.js",
+    "turf": "./bin/turf-agent.js"
   },
+  "files": [
+    "bin",
+    "server",
+    "client/dist",
+    "demo",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node server/index.js",
     "turf": "node bin/turf.js",
-    "demo": "node demo/run-demo.js"
+    "demo": "node demo/run-demo.js",
+    "test": "node test/e2e-test.js",
+    "build:client": "node client/test-build.js"
   },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YugSrivastav/turfcode-dryrun.git"
+  },
+  "keywords": [
+    "turfcode",
+    "multi-agent",
+    "intent-locking",
+    "git-worktrees",
+    "peacemaker",
+    "ast-verification",
+    "blessed-tui",
+    "cockpit"
+  ],
+  "author": "Team Ace of Spade",
+  "license": "MIT",
   "dependencies": {
+    "@babel/parser": "^7.29.9",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
     "@xterm/addon-serialize": "^0.14.0",
     "@xterm/headless": "^6.0.0",
     "blessed": "^0.1.81",

@@ -97,8 +97,11 @@ async function runDemo() {
     if (verifyResult.valid) {
         console.log(`[✓] Syntax Check Passed (node --check OK) - ${verifyResult.durationMs}ms`);
         console.log(`[✓] Symbol Audit Passed`);
+        if (verifyResult.astAudit && verifyResult.astAudit.passed) {
+            console.log(`[✓] Babel AST Semantic Audit Passed (${verifyResult.astAudit.exports.length} export(s) preserved: ${verifyResult.astAudit.exports.join(', ')})`);
+        }
         
-        console.log("\\n[Act 4: The Punchline (1:20 – 1:40)]");
+        console.log("\n[Act 4: The Punchline (1:20 – 1:40)]");
         console.log("Final Merged output synced successfully.");
         console.log("-----------------------------------------");
         console.log(mergedContent);
@@ -109,8 +112,8 @@ async function runDemo() {
     
     // Cleanup
     try {
-        removeWorktree(agentAWorktree);
-        removeWorktree(agentBWorktree);
+        removeWorktree(agentAWorktree, repoPath);
+        removeWorktree(agentBWorktree, repoPath);
     } catch(e) {}
 }
 

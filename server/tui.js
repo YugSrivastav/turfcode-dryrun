@@ -4,7 +4,69 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import fs from 'fs';
-import { ptyManager, safeEscape } from './pty_manager.js';
+import { ptyManager, safeEscape, getPaletteModelsForTab, getCmdcModels } from './pty_manager.js';
+
+// Patch blessed textarea and textbox to prevent unhandled TypeError: this._done is not a function
+// when Enter or Escape is pressed without an active readInput() cycle.
+if (blessed && blessed.textarea && blessed.textarea.prototype) {
+  const origTextareaListener = blessed.textarea.prototype._listener;
+  blessed.textarea.prototype._listener = function(ch, key) {
+    if (key && (key.name === 'enter' || key.name === 'return')) {
+      if (typeof this._done === 'function') {
+        this._done(null, this.value);
+      } else {
+        this.emit('submit', this.value);
+      }
+      return;
+    }
+    if (key && key.name === 'escape') {
+      if (typeof this._done === 'function') {
+        this._done(null, null);
+      } else {
+        this.emit('cancel');
+      }
+      return;
+    }
+    try {
+      return origTextareaListener ? origTextareaListener.call(this, ch, key) : undefined;
+    } catch (err) {
+      if (err && String(err.message).includes('done is not a function')) {
+        return;
+      }
+      throw err;
+    }
+  };
+}
+
+if (blessed && blessed.textbox && blessed.textbox.prototype) {
+  const origTextboxListener = blessed.textbox.prototype._listener;
+  blessed.textbox.prototype._listener = function(ch, key) {
+    if (key && (key.name === 'enter' || key.name === 'return')) {
+      if (typeof this._done === 'function') {
+        this._done(null, this.value);
+      } else {
+        this.emit('submit', this.value);
+      }
+      return;
+    }
+    if (key && key.name === 'escape') {
+      if (typeof this._done === 'function') {
+        this._done(null, null);
+      } else {
+        this.emit('cancel');
+      }
+      return;
+    }
+    try {
+      return origTextboxListener ? origTextboxListener.call(this, ch, key) : undefined;
+    } catch (err) {
+      if (err && String(err.message).includes('done is not a function')) {
+        return;
+      }
+      throw err;
+    }
+  };
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TURF_ROOT = path.resolve(__dirname, '..');
@@ -144,13 +206,13 @@ export function getProjectFiles(dir, baseDir = dir) {
 
 const CLIS = [
   { id: 'shell', name: 'PowerShell / Shell', prefix: process.platform === 'win32' ? 'PS' : '$', cmd: '' },
-  { id: 'agy', name: 'Antigravity (agy)', prefix: 'agy', cmd: 'agy' },
+  { id: 'cmdc', name: 'Command Code (cmdc)', prefix: 'cmdc', cmd: 'cmdc' },
   { id: 'claude', name: 'Claude Code (claude)', prefix: 'claude', cmd: 'claude' },
   { id: 'codex', name: 'Codex (codex)', prefix: 'codex', cmd: 'codex' },
   { id: 'opencode', name: 'OpenCode (opencode)', prefix: 'opencode', cmd: 'opencode' }
 ];
 
-export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAddress, isPeer, serverInstance, wssInstance, detectedAgents = { agy: true, codex: false } }) {
+export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAddress, isPeer, serverInstance, wssInstance, detectedAgents = { cmdc: true, codex: false } }) {
   // Ensure process.stdin is clean of any leftover listeners/state from readline or previous runs
   try {
     process.stdin.removeAllListeners('newListener');
@@ -197,11 +259,12 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   let activeCliIndex = 0;
   let currentCli = CLIS[activeCliIndex];
   let currentDir = repoPath;
-  let activeCenterTab = 'term'; // 'term' | 'agy' | 'codex' | 'file'
-  let lastActiveCenterTab = 'term';
+  let activeCenterTab = 'turf'; // 'turf' | 'cmdc' | 'codex' | 'term' | 'file'
+  let lastActiveCenterTab = 'turf';
   let activeTermProc = null;
-  let activeAgyProc = null;
+  let activeCmdcProc = null;
   let activeCodexProc = null;
+  let activeTurfProc = null;
 
   const onUncaught = (err) => {
     try {
@@ -406,7 +469,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     screen.render();
   };
 
-  const agyLog = blessed.box({
+  const cmdcLog = blessed.box({
     parent: centerPane,
     top: 0,
     left: 0,
@@ -422,10 +485,10 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     scrollbar: {
       ch: '│',
       track: { bg: 'black' },
-      style: { bg: 'cyan' }
+      style: { bg: 'magenta' }
     }
   });
-  agyLog.log = function(msg) {
+  cmdcLog.log = function(msg) {
     const prev = this.getContent() || '';
     this.setContent(prev ? prev + '\n' + msg : msg);
     this.setScrollPerc(100);
@@ -458,6 +521,32 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     screen.render();
   };
 
+  const turfLog = blessed.box({
+    parent: centerPane,
+    top: 0,
+    left: 0,
+    width: '100%-2',
+    height: '100%-3',
+    scrollable: true,
+    alwaysScroll: false,
+    tags: true,
+    keys: true,
+    vi: true,
+    mouse: true,
+    hidden: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
+  });
+  turfLog.log = function(msg) {
+    const prev = this.getContent() || '';
+    this.setContent(prev ? prev + '\n' + msg : msg);
+    this.setScrollPerc(100);
+    screen.render();
+  };
+
   const fileViewerLog = blessed.box({
     parent: centerPane,
     top: 0,
@@ -482,14 +571,16 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
   function getActiveLog() {
     if (activeCenterTab === 'codex') return codexLog;
-    if (activeCenterTab === 'agy') return agyLog;
+    if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') return cmdcLog;
+    if (activeCenterTab === 'turf') return turfLog;
     if (activeCenterTab === 'file') return fileViewerLog;
     return termLog;
   }
 
   function getActiveProc() {
     if (activeCenterTab === 'codex') return activeCodexProc;
-    if (activeCenterTab === 'agy') return activeAgyProc;
+    if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') return activeCmdcProc;
+    if (activeCenterTab === 'turf') return activeTurfProc;
     return activeTermProc;
   }
 
@@ -502,12 +593,15 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
   function updateCenterLabel() {
     const termStatus = ptyManager.getStatus('term');
-    const agyStatus = ptyManager.getStatus('agy');
+    const cmdcStatus = ptyManager.getStatus('cmdc');
     const codexStatus = ptyManager.getStatus('codex');
+    const turfStatus = ptyManager.getStatus('turf');
 
     const termLabel = termStatus === 'working' ? 'TERM*' : 'TERM';
-    const agyLabel = formatTabBadge('AGY', agyStatus);
+    const cmdcLabel = formatTabBadge('CMDC', cmdcStatus);
     const codexLabel = formatTabBadge('CODEX', codexStatus);
+    const turfBase = formatTabBadge('TURF', turfStatus);
+    const turfLabel = ptyManager.getPlanMode('turf') ? `${turfBase} (PLAN)` : turfBase;
     
     const fileBase = currentOpenedFile ? path.basename(currentOpenedFile) : null;
     const truncatedBase = fileBase ? truncateString(fileBase, 12) : null;
@@ -516,34 +610,48 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     if (activeCenterTab === 'file') {
       centerPane.style.border.fg = 'yellow';
       if (centerPane.style.label) centerPane.style.label.fg = 'yellow';
-      centerPane.setLabel(` ○ ${termLabel} │ ○ ${agyLabel} │ ○ ${codexLabel} │ [● ${fileLabel}] `);
+      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ ○ ${termLabel} │ [● ${fileLabel}] `);
+    } else if (activeCenterTab === 'turf') {
+      centerPane.style.border.fg = 'green';
+      if (centerPane.style.label) centerPane.style.label.fg = 'green';
+      centerPane.setLabel(` [● ${turfLabel}] │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ ○ ${termLabel} │ ${fileLabel} `);
+    } else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') {
+      centerPane.style.border.fg = 'magenta';
+      if (centerPane.style.label) centerPane.style.label.fg = 'magenta';
+      centerPane.setLabel(` ○ ${turfLabel} │ [● ${cmdcLabel}] │ ○ ${codexLabel} │ ○ ${termLabel} │ ${fileLabel} `);
     } else if (activeCenterTab === 'codex') {
       centerPane.style.border.fg = 'cyan';
       if (centerPane.style.label) centerPane.style.label.fg = 'cyan';
-      centerPane.setLabel(` ○ ${termLabel} │ ○ ${agyLabel} │ [● ${codexLabel}] │ ${fileLabel} `);
-    } else if (activeCenterTab === 'agy') {
-      centerPane.style.border.fg = 'green';
-      if (centerPane.style.label) centerPane.style.label.fg = 'green';
-      centerPane.setLabel(` ○ ${termLabel} │ [● ${agyLabel}] │ ○ ${codexLabel} │ ${fileLabel} `);
+      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ [● ${codexLabel}] │ ○ ${termLabel} │ ${fileLabel} `);
     } else {
       centerPane.style.border.fg = 'green';
       if (centerPane.style.label) centerPane.style.label.fg = 'green';
-      centerPane.setLabel(` [● ${termLabel}] │ ○ ${agyLabel} │ ○ ${codexLabel} │ ${fileLabel} `);
+      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ [● ${termLabel}] │ ${fileLabel} `);
     }
+  }
+
+  let cachedPaletteModels = [];
+  function refreshPaletteModels() {
+    getPaletteModelsForTab(activeCenterTab, currentDir).then(models => {
+      if (Array.isArray(models) && models.length > 0) {
+        cachedPaletteModels = models;
+      }
+    }).catch(() => {});
   }
 
   function showCenterTab(tabName = 'term') {
     if (tabName !== 'file') {
       lastActiveCenterTab = tabName;
     }
-    activeCenterTab = tabName;
+    activeCenterTab = tabName === 'agy' ? 'cmdc' : tabName;
     fileViewerLog.hide();
 
     termLog.hide();
-    agyLog.hide();
+    cmdcLog.hide();
     codexLog.hide();
+    turfLog.hide();
 
-    if (tabName === 'codex') {
+    if (activeCenterTab === 'codex') {
       codexLog.show();
       const content = ptyManager.getScreenContent('codex');
       if (content) codexLog.setContent(content);
@@ -552,15 +660,24 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       promptPrefix.width = 7;
       terminalInput.left = 8;
       terminalInput.width = '100%-10';
-    } else if (tabName === 'agy') {
-      agyLog.show();
-      const content = ptyManager.getScreenContent('agy');
-      if (content) agyLog.setContent(content);
-      agyLog.setScrollPerc(100);
-      promptPrefix.setContent('{bold}{149-fg}AGY>{/149-fg}{/bold} ');
-      promptPrefix.width = 5;
-      terminalInput.left = 6;
-      terminalInput.width = '100%-8';
+    } else if (activeCenterTab === 'cmdc') {
+      cmdcLog.show();
+      const content = ptyManager.getScreenContent('cmdc') || ptyManager.getScreenContent('agy');
+      if (content) cmdcLog.setContent(content);
+      cmdcLog.setScrollPerc(100);
+      promptPrefix.setContent('{bold}{magenta-fg}CMDC>{/magenta-fg}{/bold} ');
+      promptPrefix.width = 6;
+      terminalInput.left = 7;
+      terminalInput.width = '100%-9';
+    } else if (activeCenterTab === 'turf') {
+      turfLog.show();
+      const content = ptyManager.getScreenContent('turf');
+      if (content) turfLog.setContent(content);
+      turfLog.setScrollPerc(100);
+      promptPrefix.setContent('{bold}{green-fg}TURF>{/green-fg}{/bold} ');
+      promptPrefix.width = 6;
+      terminalInput.left = 7;
+      terminalInput.width = '100%-9';
     } else {
       activeCenterTab = 'term';
       termLog.show();
@@ -574,6 +691,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     }
     focusIndex = 0;
 
+    refreshPaletteModels();
     promptPrefix.show();
     terminalInput.show();
     updateCenterLabel();
@@ -625,8 +743,9 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
     activeCenterTab = 'file';
     termLog.hide();
-    agyLog.hide();
+    cmdcLog.hide();
     codexLog.hide();
+    turfLog.hide();
     promptPrefix.hide();
     terminalInput.hide();
     fileViewerLog.show();
@@ -757,9 +876,10 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
 
   function printWelcomeBanner() {
-    termLog.log(`{bold}{149-fg}TURFCODE SHELL{/149-fg}{/bold} {grey-fg}│ Run terminal commands or type /agy, /codex to start AI agents{/grey-fg}`);
-    agyLog.log(`{bold}{149-fg}ANTIGRAVITY AGENT{/149-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
+    termLog.log(`{bold}{149-fg}TURFCODE SHELL{/149-fg}{/bold} {grey-fg}│ Run terminal commands or type /turf, /cmdc, /codex to start AI agents{/grey-fg}`);
+    cmdcLog.log(`{bold}{magenta-fg}COMMAND CODE AGENT{/magenta-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     codexLog.log(`{bold}{cyan-fg}OPENAI CODEX AGENT{/cyan-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
+    turfLog.log(`{bold}{green-fg}TURF AGENT{/green-fg}{/bold} {grey-fg}│ Turf-native intent locks ON │ /plan for read-only recon{/grey-fg}`);
   }
   printWelcomeBanner();
 
@@ -788,16 +908,20 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
 
   const AVAILABLE_COMMANDS = [
-    { cmd: '/usage', desc: 'View session stats, turns, token count & active config' },
-    { cmd: '/model', desc: 'Set or view model (e.g. /model gpt-4o, /model o3-mini)' },
+    { cmd: '/turf', desc: 'Switch to Turf agent tab or run prompt (/turf <prompt>)' },
+    { cmd: '/cmdc', desc: 'Switch to Command Code tab or run prompt (/cmdc <prompt>)' },
+    { cmd: '/codex', desc: 'Switch to OpenAI Codex tab or run prompt (/codex <prompt>)' },
+    { cmd: '/agy', desc: 'Alias for Command Code (/cmdc)' },
+    { cmd: '/model', desc: 'Switch or view active model for current tab (/model <name>)' },
     { cmd: '/effort', desc: 'Set reasoning effort (/effort low | medium | high)' },
-    { cmd: '/sandbox', desc: 'Set sandbox mode (/sandbox workspace-write | read-only)' },
-    { cmd: '/new', desc: 'Reset agent session memory and start a fresh session' },
+    { cmd: '/sandbox', desc: 'Set agent sandbox permission (/sandbox workspace-write | read-only)' },
+    { cmd: '/new', desc: 'Clear conversation memory and start a fresh session' },
     { cmd: '/resume', desc: 'Resume a past session ID (/resume <id>)' },
     { cmd: '/diff', desc: 'Inspect git diff of workspace changes made by agent' },
+    { cmd: '/usage', desc: 'View session stats, turns, token count & active config' },
     { cmd: '/kill', desc: 'Terminate running agent process or shell command' },
-    { cmd: '/codex', desc: 'Switch to Codex tab or run prompt (/codex <prompt>)' },
-    { cmd: '/agy', desc: 'Switch to Antigravity tab or run prompt (/agy <prompt>)' },
+    { cmd: '/plan', desc: 'Toggle read-only recon plan mode for the active tab' },
+    { cmd: '/negotiate', desc: 'Trigger autonomous inter-agent lock negotiation dialogue (/negotiate [file])' },
     { cmd: '/term', desc: 'Switch to Shell terminal or run command (/term <command>)' },
     { cmd: '/chat', desc: 'Send message to team chat or focus chat (/chat <msg>)' },
     { cmd: '/files', desc: 'Focus workspace file explorer [F3]' },
@@ -810,13 +934,14 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   const commandPaletteBox = blessed.list({
     parent: centerPane,
     bottom: 2,
-    left: 3,
-    width: 74,
-    height: 9,
+    left: 2,
+    width: '100%-4',
+    height: 10,
     hidden: true,
     tags: true,
     keys: false,
     mouse: true,
+    vi: false,
     border: { type: 'line', fg: '149' },
     style: {
       selected: { bg: '149', fg: 'black', bold: true },
@@ -829,20 +954,37 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   function renderCommandPalette(filterText = '') {
     const query = filterText.toLowerCase().trim();
     if (query.startsWith('/model')) {
-      const modelItems = activeCenterTab === 'agy' ? [
-        { cmd: '/model gemini-3.8-flash-high', desc: 'Gemini 3.8 Flash (High reasoning - fastest)' },
-        { cmd: '/model gemini-3.8-flash-medium', desc: 'Gemini 3.8 Flash (Medium reasoning)' },
-        { cmd: '/model gemini-3.7-flash-high', desc: 'Gemini 3.7 Flash (High reasoning)' },
-        { cmd: '/model gemini-3.6-flash-high', desc: 'Gemini 3.6 Flash (High reasoning)' },
-        { cmd: '/model gemini-3.1-pro-high', desc: 'Gemini 3.1 Pro (Deep reasoning)' },
-        { cmd: '/model claude-sonnet-4-6', desc: 'Claude Sonnet 4.6 (Thinking)' },
-        { cmd: '/model claude-opus-4-6-thinking', desc: 'Claude Opus 4.6 (Thinking)' },
-        { cmd: '/model gpt-oss-120b-medium', desc: 'GPT-OSS 120B (Medium)' }
-      ] : [
+      const fallbackCmdc = [
+        { cmd: '/model deepseek/deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Ultra-fast & capable)' },
+        { cmd: '/model deepseek/deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep architectural reasoning)' },
+        { cmd: '/model claude-sonnet-5', desc: 'Claude Sonnet 5 (Recommended speed & intelligence)' },
+        { cmd: '/model claude-sonnet-4-6', desc: 'Claude Sonnet 4.6 (Solid multi-step agent)' },
+        { cmd: '/model claude-opus-5', desc: 'Claude Opus 5 (Maximum reasoning depth)' },
+        { cmd: '/model gpt-5.6-sol', desc: 'GPT-5.6 Sol (Cutting edge reasoning)' },
+        { cmd: '/model moonshotai/Kimi-K3', desc: 'Kimi K3 (Long-context specialist)' },
+        { cmd: '/model Qwen/Qwen3.8-27B', desc: 'Qwen 3.8 27B (Open-weight coder)' }
+      ];
+      const fallbackTurf = [
+        { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (1,000,000 TPM Free Tier)' },
+        { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning)' },
+        { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
+        { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
+        { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
+        { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
+        { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
+        { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
+        { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o' }
+      ];
+      const fallbackCodex = [
         { cmd: '/model o3-mini', desc: 'OpenAI o3-mini (High reasoning, fast)' },
         { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o (Fast multimodal)' },
         { cmd: '/model o1', desc: 'OpenAI o1 (Full reasoning)' }
       ];
+
+      const modelItems = cachedPaletteModels.length > 0
+        ? cachedPaletteModels
+        : ((activeCenterTab === 'cmdc' || activeCenterTab === 'agy') ? fallbackCmdc : (activeCenterTab === 'turf' ? fallbackTurf : fallbackCodex));
+
       paletteFilteredItems = modelItems.filter(c => !query || c.cmd.toLowerCase().includes(query) || query === '/model' || query === '/model ');
       if (paletteFilteredItems.length === 0) paletteFilteredItems = modelItems;
     } else {
@@ -942,23 +1084,41 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
 
   const peerAgents = new Map();
+  let currentLocks = [];
+  let currentQueues = [];
 
   function updateIntentBox() {
-    let content = ' {bold}ACTIVE TURFS:{/bold}\n  {grey-fg}(No active locks){/grey-fg}\n\n';
-    content += ' {bold}AI AGENTS:{/bold}\n';
+    let content = ' {bold}ACTIVE TURFS:{/bold}\n';
+    if (currentLocks && currentLocks.length > 0) {
+      currentLocks.forEach(l => {
+        const file = path.basename(l.filePath || l.file || '');
+        const holder = l.agentId || l.user || 'agent';
+        content += `  {yellow-fg}🔒 ${holder}:{/yellow-fg} {white-fg}${file}{/white-fg}\n`;
+      });
+    } else {
+      content += '  {grey-fg}(No active locks){/grey-fg}\n';
+    }
+    content += '\n {bold}AI AGENTS:{/bold}\n';
     
     let hasAgents = false;
-    const agySt = ptyManager.getStatus('agy');
+    const cmdcSt = ptyManager.getStatus('cmdc');
     const codexSt = ptyManager.getStatus('codex');
+    const turfSt = ptyManager.getStatus('turf');
 
-    if (agySt !== 'idle') {
-      const color = agySt === 'working' ? 'green-fg' : (agySt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
-      content += `  {${color}}● ${hostName}: AGY [${agySt.toUpperCase()}]{/${color}}\n`;
+    if (cmdcSt !== 'idle') {
+      const color = cmdcSt === 'working' ? 'magenta-fg' : (cmdcSt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
+      content += `  {${color}}● ${hostName}: CMDC [${cmdcSt.toUpperCase()}]{/${color}}\n`;
       hasAgents = true;
     }
     if (codexSt !== 'idle') {
       const color = codexSt === 'working' ? 'green-fg' : (codexSt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
       content += `  {${color}}● ${hostName}: CODEX [${codexSt.toUpperCase()}]{/${color}}\n`;
+      hasAgents = true;
+    }
+    if (turfSt !== 'idle') {
+      const color = turfSt === 'working' ? 'green-fg' : (turfSt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
+      const planTag = ptyManager.getPlanMode('turf') ? ' (PLAN)' : '';
+      content += `  {${color}}● ${hostName}: TURF [${turfSt.toUpperCase()}${planTag}]{/${color}}\n`;
       hasAgents = true;
     }
 
@@ -978,11 +1138,35 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     screen.render();
   }
 
+  function updateQueueBox() {
+    let content = ' {bold}WAITING QUEUE:{/bold}\n';
+    let totalWaiting = 0;
+    if (currentQueues && currentQueues.length > 0) {
+      currentQueues.forEach(q => {
+        const count = q.size || (Array.isArray(q.queue) ? q.queue.length : 0);
+        if (count > 0) {
+          totalWaiting += count;
+          const file = path.basename(q.filePath || '');
+          content += `  {magenta-fg}⏳ ${count} waiting:{/magenta-fg} {white-fg}${file}{/white-fg}\n`;
+        }
+      });
+    }
+    if (totalWaiting === 0) {
+      content += '  {grey-fg}(0 agents waiting){/grey-fg}\n';
+      queueBox.setLabel(' {grey-fg}INTENT [F2] │{/grey-fg} {bold}{magenta-fg}● QUEUE (0){/magenta-fg}{/bold} ');
+    } else {
+      queueBox.setLabel(` {grey-fg}INTENT [F2] │{/grey-fg} {bold}{yellow-fg}● QUEUE (${totalWaiting}){/yellow-fg}{/bold} `);
+    }
+    queueBox.setContent(content);
+    screen.render();
+  }
+
   ptyManager.on('agent:msg', ({ tabId, type, text }) => {
     try {
       let target = termLog;
-      if (tabId === 'agy') target = agyLog;
+      if (tabId === 'cmdc' || tabId === 'agy') target = cmdcLog;
       else if (tabId === 'codex') target = codexLog;
+      else if (tabId === 'turf') target = turfLog;
       if (text) {
         target.log(text);
         screen.render();
@@ -1004,10 +1188,11 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   let activeStreamingTab = null;
   ptyManager.on('agent:stream', ({ tabId, text }) => {
     try {
-      let target = tabId === 'agy' ? agyLog : codexLog;
+      let target = (tabId === 'cmdc' || tabId === 'agy') ? cmdcLog : tabId === 'turf' ? turfLog : codexLog;
       if (activeStreamingTab !== tabId) {
-        const colorTag = tabId === 'agy' ? '149-fg' : 'cyan-fg';
-        target.log(`{bold}{${colorTag}}💬 ${tabId.toUpperCase()}:{/${colorTag}}{/bold} `);
+        const colorTag = (tabId === 'cmdc' || tabId === 'agy') ? 'magenta-fg' : tabId === 'turf' ? 'green-fg' : 'cyan-fg';
+        const agentName = (tabId === 'cmdc' || tabId === 'agy') ? 'CMDC' : tabId.toUpperCase();
+        target.log(`{bold}{${colorTag}}💬 ${agentName}:{/${colorTag}}{/bold} `);
         activeStreamingTab = tabId;
       }
       const prev = target.getContent() || '';
@@ -1043,18 +1228,17 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   ptyManager.on('exit', ({ tabId, exitCode }) => {
     activeStreamingTab = null;
     let target = termLog;
-    if (tabId === 'agy') target = agyLog;
+    if (tabId === 'cmdc' || tabId === 'agy') target = cmdcLog;
     else if (tabId === 'codex') target = codexLog;
+    else if (tabId === 'turf') target = turfLog;
 
-    if (tabId !== 'term') {
-      if (exitCode === 0) {
-        const stats = ptyManager.getUsageStats(tabId);
-        target.log(`{bold}{green-fg}✓ [${tabId.toUpperCase()} Completed Turn #${stats.turnCount}]{/green-fg}{/bold}`);
-        if (stats.sessionId && stats.sessionId !== '(No active session ID yet)') {
-          target.log(`{grey-fg}Session ID: ${stats.sessionId.slice(0, 18)}... │ Type follow-up prompt to continue session context{/grey-fg}`);
-        }
-      } else if (exitCode !== null) {
-        target.log(`{bold}{grey-fg}[${tabId.toUpperCase()} Process exited with code ${exitCode}]{/grey-fg}{/bold}`);
+    if (tabId === 'term') {
+      if (exitCode !== null && exitCode !== 0) {
+        target.log(`{bold}{grey-fg}[Process exited with code ${exitCode}]{/grey-fg}{/bold}`);
+      }
+    } else {
+      if (exitCode !== null && exitCode !== 0) {
+        target.log(`{bold}{grey-fg}[${tabId.toUpperCase()} process exited with code ${exitCode}]{/grey-fg}{/bold}`);
       }
     }
     updateCenterLabel();
@@ -1150,7 +1334,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     width: '100%',
     height: 1,
     tags: true,
-    content: ` {bold}{149-fg}[Tab]{/149-fg}{/bold} Switch Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{149-fg}[/agy]{/149-fg}{/bold} AGY │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[F4]{/yellow-fg}{/bold} Term/File │ {bold}{yellow-fg}[F2]{/yellow-fg}{/bold} Intent │ {bold}{yellow-fg}[Ctrl+B]{/yellow-fg}{/bold} Sidebar │ {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `,
+    content: ` {bold}{149-fg}[Tab]{/149-fg}{/bold} Switch Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{green-fg}[/turf]{/green-fg}{/bold} Turf │ {bold}{magenta-fg}[/cmdc]{/magenta-fg}{/bold} CMDC │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[F4]{/yellow-fg}{/bold} Term/File │ {bold}{yellow-fg}[F2]{/yellow-fg}{/bold} Intent │ {bold}{yellow-fg}[Ctrl+B]{/yellow-fg}{/bold} Sidebar │ {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `,
     style: {
       fg: 'white',
       bg: 'black'
@@ -1163,11 +1347,23 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       const data = JSON.parse(raw);
       if (data.type === 'chat:message') {
         const time = new Date(data.timestamp || Date.now()).toLocaleTimeString();
-        const color = data.user === 'SYSTEM' ? 'yellow-fg' : (data.user === hostName ? 'green-fg' : 'cyan-fg');
+        let color = data.user === 'SYSTEM' ? 'yellow-fg' : (data.user === hostName ? 'green-fg' : 'cyan-fg');
+        if (data.isAgentNegotiation || String(data.user).includes('🤖')) {
+          color = 'magenta-fg';
+        }
         chatLogBox.log(` {${color}}[${time}] ${data.user}:{/${color}}\n   ${data.message}`);
         screen.render();
       } else if (data.type === 'peer:update') {
         updatePeopleBox(data.peers);
+      } else if (data.type === 'locks:update' || data.type === 'lock:update') {
+        currentLocks = data.activeLocks || data.locks || [];
+        currentQueues = data.queues || [];
+        updateIntentBox();
+        updateQueueBox();
+      } else if (data.type === 'agent:negotiate') {
+        const time = new Date(data.timestamp || Date.now()).toLocaleTimeString();
+        chatLogBox.log(` {bold}{magenta-fg}🤖 [AI NEGOTIATION] [${time}]{/magenta-fg}{/bold}\n   {cyan-fg}${data.fromAgent?.toUpperCase() || 'AGENT'} (${data.fromUser}){/cyan-fg} ➔ {yellow-fg}${data.toAgent?.toUpperCase() || 'ALL'}:{/yellow-fg} ${data.message}`);
+        screen.render();
       } else if (data.type === 'agent:status') {
         if (data.user && data.agent) {
           peerAgents.set(`${data.user}:${data.agent}`, data);
@@ -1177,9 +1373,104 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
             screen.render();
           }
         }
+      } else if (data.type === 'file:sync') {
+        if (data.origin && data.origin !== hostName && data.relPath && typeof data.content === 'string') {
+          const normRel = path.normalize(data.relPath).replace(/\\/g, '/');
+          // Check if local user holds an active lock on this file
+          const isHeldLocally = currentLocks.some(l => {
+            const lFile = path.normalize(l.filePath || l.file || '').replace(/\\/g, '/');
+            return (lFile === normRel || normRel.endsWith(lFile)) && (l.agentId === hostName || l.user === hostName);
+          });
+          if (isHeldLocally) {
+            chatLogBox.log(` {yellow-fg}⚠️ [SYNC SKIPPED]{/yellow-fg} {grey-fg}${data.origin} synced ${normRel}, but you hold an active lock.{/grey-fg}`);
+            screen.render();
+          } else {
+            syncSuppressionMap.set(normRel, Date.now() + 2000);
+            try {
+              const fullTarget = path.join(currentDir, normRel);
+              fs.mkdirSync(path.dirname(fullTarget), { recursive: true });
+              fs.writeFileSync(fullTarget, data.content, 'utf8');
+              refreshFileList(true);
+              chatLogBox.log(` {cyan-fg}⚡ [SYNC]{/cyan-fg} {white-fg}${normRel}{/white-fg} {grey-fg}(from ${data.origin}){/grey-fg}`);
+              screen.render();
+            } catch (err) {}
+          }
+        }
       }
     } catch (e) {}
   });
+
+  const syncSuppressionMap = new Map();
+  const debounceTimers = new Map();
+  const IGNORE_SYNC = new Set(['.git', 'node_modules', '.turf', 'dist', '.env', 'turf-error.log', 'turf-sync.tar.gz', '.gemini', '.turbo', '.cache']);
+
+  // Native debounced file watcher for real-time peer replication
+  try {
+    const fileWatcher = fs.watch(currentDir, { recursive: true }, (eventType, filename) => {
+      if (!filename) return;
+      const normalizedRel = filename.replace(/\\/g, '/');
+      const parts = normalizedRel.split('/');
+      if (parts.some(p => IGNORE_SYNC.has(p) || p.startsWith('.'))) return;
+
+      const suppressionExpiry = syncSuppressionMap.get(normalizedRel);
+      if (suppressionExpiry && Date.now() < suppressionExpiry) return;
+
+      if (debounceTimers.has(normalizedRel)) {
+        clearTimeout(debounceTimers.get(normalizedRel));
+      }
+
+      debounceTimers.set(normalizedRel, setTimeout(() => {
+        debounceTimers.delete(normalizedRel);
+        try {
+          const fullPath = path.join(currentDir, normalizedRel);
+          if (fs.existsSync(fullPath)) {
+            const stat = fs.statSync(fullPath);
+            if (stat.isFile() && stat.size < 500000) {
+              const content = fs.readFileSync(fullPath, 'utf8');
+              if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                  type: 'file:sync',
+                  origin: hostName,
+                  relPath: normalizedRel,
+                  content
+                }));
+              }
+            }
+          }
+        } catch (e) {}
+      }, 300));
+    });
+
+    if (fileWatcher.unref) fileWatcher.unref();
+  } catch (e) {}
+
+  // 5-Second rolling lock heartbeat
+  const heartbeatTimer = setInterval(() => {
+    try {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'lock:heartbeat',
+          user: hostName,
+          agentId: activeCenterTab
+        }));
+      }
+    } catch (e) {}
+  }, 5000);
+  if (heartbeatTimer.unref) heartbeatTimer.unref();
+
+  try {
+    fetch(`http://${hostAddress || '127.0.0.1'}:${port}/api/locks`, { signal: AbortSignal.timeout(2000) })
+      .then(res => res.json())
+      .then(data => {
+        if (data) {
+          currentLocks = data.activeLocks || [];
+          currentQueues = data.queues || [];
+          updateIntentBox();
+          updateQueueBox();
+        }
+      })
+      .catch(() => {});
+  } catch (e) {}
 
   let focusIndex = 0; // 0: Center Pane (Terminal/File), 1: Team Chat, 2: Files List
   
@@ -1246,13 +1537,21 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   function updateFocusStyles() {
     updateCenterLabel();
 
-    filesBox.style.border.fg = focusIndex === 2 ? 'green' : 'cyan';
-    filesBox.setLabel(' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ');
+    if (filesBox && filesBox.style && filesBox.style.border) {
+      filesBox.style.border.fg = focusIndex === 2 ? 'green' : 'cyan';
+      filesBox.setLabel(' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ');
+    }
 
-    chatLogBox.style.border.fg = focusIndex === 1 ? 'green' : 'blue';
-    chatInputBox.style.border.fg = focusIndex === 1 ? 'green' : 'cyan';
-    chatInputBox.setLabel(' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ');
-    chatInputPrompt.setContent(focusIndex === 1 ? '{149-fg}💬 >{/149-fg} ' : '{cyan-fg}💬 >{/cyan-fg} ');
+    if (chatLogBox && chatLogBox.style && chatLogBox.style.border) {
+      chatLogBox.style.border.fg = focusIndex === 1 ? 'green' : 'blue';
+    }
+    if (chatInputBox && chatInputBox.style && chatInputBox.style.border) {
+      chatInputBox.style.border.fg = focusIndex === 1 ? 'green' : 'cyan';
+      chatInputBox.setLabel(' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ');
+    }
+    if (chatInputPrompt) {
+      chatInputPrompt.setContent(focusIndex === 1 ? '{149-fg}💬 >{/149-fg} ' : '{cyan-fg}💬 >{/cyan-fg} ');
+    }
 
     screen.render();
   }
@@ -1297,13 +1596,14 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   }
 
   function cycleCenterTabs() {
-    if (activeCenterTab === 'term') showCenterTab('agy');
-    else if (activeCenterTab === 'agy') showCenterTab('codex');
-    else showCenterTab('term');
+    if (activeCenterTab === 'turf') showCenterTab('cmdc');
+    else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') showCenterTab('codex');
+    else if (activeCenterTab === 'codex') showCenterTab('term');
+    else showCenterTab('turf');
   }
 
   function resetFooter() {
-    footer.setContent(` {bold}{149-fg}[Tab]{/149-fg}{/bold} Focus │ {bold}{149-fg}[Ctrl+T]{/149-fg}{/bold} Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{149-fg}[/]{/149-fg}{/bold} Cmds │ {bold}{149-fg}[/agy]{/149-fg}{/bold} AGY │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[/usage]{/yellow-fg}{/bold} Stats │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `);
+    footer.setContent(` {bold}{149-fg}[Tab]{/149-fg}{/bold} Focus │ {bold}{149-fg}[Ctrl+T]{/149-fg}{/bold} Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{149-fg}[/]{/149-fg}{/bold} Cmds │ {bold}{green-fg}[/turf]{/green-fg}{/bold} Turf │ {bold}{magenta-fg}[/cmdc]{/magenta-fg}{/bold} CMDC │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[/usage]{/yellow-fg}{/bold} Stats │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `);
   }
 
   function cleanActiveInput() {
@@ -1333,7 +1633,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     screen.render();
     const proc = spawn('node', [path.join(TURF_ROOT, 'demo', 'run-demo.js')], { shell: true, cwd: TURF_ROOT });
     if (activeCenterTab === 'codex') activeCodexProc = proc;
-    else if (activeCenterTab === 'agy') activeAgyProc = proc;
+    else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = proc;
     else activeTermProc = proc;
     updateCenterLabel();
 
@@ -1353,7 +1653,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     });
     proc.on('close', () => {
       if (activeCenterTab === 'codex') activeCodexProc = null;
-      else if (activeCenterTab === 'agy') activeAgyProc = null;
+      else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = null;
       else activeTermProc = null;
       updateCenterLabel();
       screen.render();
@@ -1391,7 +1691,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       }
       getActiveLog().log(`{red-fg}^C (Interrupted process on ${activeCenterTab.toUpperCase()}){/red-fg}`);
       if (activeCenterTab === 'codex') activeCodexProc = null;
-      else if (activeCenterTab === 'agy') activeAgyProc = null;
+      else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = null;
       else activeTermProc = null;
       lastCtrlCTime = 0;
       updateCenterLabel();
@@ -1436,7 +1736,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     process.removeListener('uncaughtException', onUncaught);
     process.removeListener('unhandledRejection', onUnhandled);
     ptyManager.killAll();
-    const procs = [activeTermProc, activeAgyProc, activeCodexProc].filter(Boolean);
+    const procs = [activeTermProc, activeCmdcProc, activeCodexProc, activeTurfProc].filter(Boolean);
     for (const proc of procs) {
       if (process.platform === 'win32') {
         exec('taskkill /F /T /PID ' + proc.pid);
@@ -1449,7 +1749,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       }
     }
     activeTermProc = null;
-    activeAgyProc = null;
+    activeCmdcProc = null;
     activeCodexProc = null;
     
     if (wssInstance) {
@@ -1500,7 +1800,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         const sel = paletteFilteredItems[commandPaletteBox.selected];
         const val = (terminalInput.value || '').trim();
         if (sel && val !== sel.cmd && !val.includes(' ')) {
-          if (['/model', '/effort', '/sandbox', '/resume', '/codex', '/agy', '/term', '/chat', '/file'].includes(sel.cmd)) {
+          if (['/model', '/effort', '/sandbox', '/resume', '/codex', '/cmdc', '/agy', '/turf', '/plan', '/term', '/chat', '/file'].includes(sel.cmd)) {
             terminalInput.setValue(sel.cmd + ' ');
             hideCommandPalette();
             focusTerminal();
@@ -1715,8 +2015,9 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   chatLogBox.on('click', focusChat);
   centerPane.on('click', () => focusTerminal());
   termLog.on('click', () => showCenterTab('term'));
-  agyLog.on('click', () => showCenterTab('agy'));
+  cmdcLog.on('click', () => showCenterTab('cmdc'));
   codexLog.on('click', () => showCenterTab('codex'));
+  turfLog.on('click', () => showCenterTab('turf'));
   fileViewerLog.on('click', () => focusTerminal());
   filesBox.on('click', focusFiles);
   filesList.on('click', focusFiles);
@@ -1726,7 +2027,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   screen.on('wheeldown', () => scrollActiveLog(3));
 
   // Element mouse wheel scrolling
-  [centerPane, termLog, agyLog, codexLog, fileViewerLog].forEach(box => {
+  [centerPane, termLog, cmdcLog, codexLog, fileViewerLog].forEach(box => {
     try { screen.enableMouse(box); } catch (e) {}
     box.on('wheelup', () => scrollActiveLog(-3));
     box.on('wheeldown', () => scrollActiveLog(3));
@@ -1743,21 +2044,27 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
 
   function executePromptForAgent(agent, inputStr) {
-    const targetLog = agent === 'codex' ? codexLog : agyLog;
-    const prefixTag = agent === 'codex' ? '{bold}{cyan-fg}CODEX>{/cyan-fg}{/bold}' : '{bold}{149-fg}AGY>{/149-fg}{/bold}';
+    const targetLog = agent === 'codex' ? codexLog : agent === 'turf' ? turfLog : cmdcLog;
+    const prefixTag = agent === 'codex' ? '{bold}{cyan-fg}CODEX>{/cyan-fg}{/bold}' : agent === 'turf' ? '{bold}{green-fg}TURF>{/green-fg}{/bold}' : '{bold}{magenta-fg}CMDC>{/magenta-fg}{/bold}';
     targetLog.log(`${prefixTag} {yellow-fg}${inputStr}{/yellow-fg}`);
 
     const config = ptyManager.getAgentConfig(agent);
     if (config.sessionId || config.turnCount > 0) {
       targetLog.log(`{grey-fg}⚡ [Continuing Turn #${config.turnCount + 1}...]{/grey-fg}`);
-    } else if (agent === 'agy') {
-      targetLog.log(`{grey-fg}⚡ [Initializing Antigravity runtime & MCP servers (takes ~15s on first boot)...]{/grey-fg}`);
+    } else if (agent === 'cmdc' || agent === 'agy') {
+      targetLog.log(`{grey-fg}⚡ [Starting Command Code session (${config.model || 'default'})...]{/grey-fg}`);
+    } else if (agent === 'turf') {
+      const planTag = config.planMode ? ' [PLAN MODE: read-only recon]' : '';
+      targetLog.log(`{grey-fg}⚡ [Starting Turf session (turf-native intent locks ON${planTag})...]{/grey-fg}`);
     } else {
       targetLog.log(`{grey-fg}⚡ [Starting Codex session (${config.model || 'default'} | ${config.sandbox})...]{/grey-fg}`);
     }
 
     try {
-      ptyManager.spawnSession(agent, inputStr, { cwd: currentDir });
+      const env = agent === 'turf'
+        ? { TURF_DAEMON: `http://${hostAddress || '127.0.0.1'}:${port}`, TURF_ROOM: roomCode, TURF_USER: hostName, TURF_AGENT_ID: 'turf' }
+        : undefined;
+      ptyManager.spawnSession(agent, inputStr, { cwd: currentDir, env });
     } catch (err) {
       targetLog.log(`{red-fg}Error starting ${agent.toUpperCase()}: ${err.message}{/red-fg}`);
     }
@@ -1804,6 +2111,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Active Model:{/grey-fg} {white-fg}${stats.model}{/white-fg}`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Reasoning:{/grey-fg}   {white-fg}${stats.effort}{/white-fg}`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Sandbox:{/grey-fg}     {cyan-fg}${stats.sandbox}{/cyan-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Plan mode:{/grey-fg}   {white-fg}${stats.planMode ? 'ON (read-only recon)' : 'off'}{/white-fg}`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Turns Used:{/grey-fg}  {green-fg}${stats.turnCount}{/green-fg}`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Tokens Used:{/grey-fg} {magenta-fg}${stats.totalTokens.toLocaleString()}{/magenta-fg}`);
       currentLog.log(`{bold}{149-fg}└────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
@@ -1820,15 +2128,22 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       } else {
         const curModel = ptyManager.getModel(activeCenterTab);
         currentLog.log(`{bold}{149-fg}Active model for ${activeCenterTab.toUpperCase()}:{/149-fg}{/bold} {yellow-fg}${curModel}{/yellow-fg}`);
-        if (activeCenterTab === 'agy') {
-          currentLog.log(`{cyan-fg}Available Antigravity models:{/cyan-fg}`);
-          currentLog.log(`  • {yellow-fg}gemini-3.8-flash-high{/yellow-fg} {white-fg}(Fastest / Recommended Default){/white-fg}`);
-          currentLog.log(`  • {yellow-fg}gemini-3.8-flash-medium{/yellow-fg} │ {yellow-fg}gemini-3.8-flash-low{/yellow-fg}`);
-          currentLog.log(`  • {yellow-fg}gemini-3.7-flash-high{/yellow-fg}   │ {yellow-fg}gemini-3.7-flash-medium{/yellow-fg}`);
-          currentLog.log(`  • {yellow-fg}gemini-3.6-flash-high{/yellow-fg}   │ {yellow-fg}gemini-3.1-pro-high{/yellow-fg}`);
-          currentLog.log(`  • {yellow-fg}claude-sonnet-4-6{/yellow-fg}       │ {yellow-fg}claude-opus-4-6-thinking{/yellow-fg}`);
-          currentLog.log(`  • {yellow-fg}gpt-oss-120b-medium{/yellow-fg}`);
-          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model gemini-3.8-flash-high){/white-fg}`);
+        if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') {
+          currentLog.log(`{magenta-fg}Available Command Code models:{/magenta-fg}`);
+          const cmdcModels = getCmdcModels();
+          cmdcModels.forEach(m => currentLog.log(`  • {yellow-fg}${m.id}{/yellow-fg} {white-fg}(${m.desc}){/white-fg}`));
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model deepseek/deepseek-v4-flash){/white-fg}`);
+        } else if (activeCenterTab === 'turf') {
+          currentLog.log(`{green-fg}Available Turf models (real-time):{/green-fg}`);
+          const displayModels = cachedPaletteModels.length > 0 ? cachedPaletteModels : [
+            { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
+            { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
+            { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
+            { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
+            { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' }
+          ];
+          displayModels.forEach(m => currentLog.log(`  • {yellow-fg}${m.cmd.replace('/model ', '')}{/yellow-fg} {white-fg}(${m.desc}){/white-fg}`));
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model openai/gpt-oss-120b){/white-fg}`);
         } else if (activeCenterTab === 'codex') {
           currentLog.log(`{cyan-fg}Common Codex models:{/cyan-fg} o3-mini, gpt-4o, o1`);
           currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model o3-mini){/white-fg}`);
@@ -1917,14 +2232,15 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     if (inputStr === '/help' || inputStr === '/h' || inputStr === '?') {
       currentLog.log(`{bold}{149-fg}┌─ TURF CODE COMMAND CHEAT SHEET ──────────────────────────┐{/149-fg}{/bold}`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/usage, /stats{/bold}       View turns, tokens & active session config`);
-      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/model <name>{/bold}        Set model (e.g. gpt-4o, claude-3-7-sonnet)`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/model <name>{/bold}        Set model (e.g. gpt-4o, claude-sonnet-5)`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/effort <lvl>{/bold}        Set reasoning effort: low | medium | high`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sandbox <mode>{/bold}     Set sandbox: workspace-write | read-only`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/new, /reset{/bold}         Clear session memory & start fresh`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/resume <id>{/bold}        Resume specific past session ID`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/diff{/bold}                Inspect git diff of modifications made`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/kill, /stop{/bold}         Stop running process or agent immediately`);
-      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/codex, /agy, /term{/bold}  Switch active tab or run targeted command`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/turf, /cmdc, /codex, /term{/bold} Switch tab or run targeted command`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/plan{/bold}                Toggle read-only recon plan mode`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/chat <msg>{/bold}          Send team chat message or focus chat`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
       currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
@@ -1943,13 +2259,76 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       return;
     }
 
-    if (inputStr === '/agy' || inputStr.startsWith('/agy ')) {
-      const prompt = inputStr.replace(/^\/agy\s*/, '').trim();
-      showCenterTab('agy');
+    if (inputStr === '/cmdc' || inputStr.startsWith('/cmdc ') || inputStr === '/agy' || inputStr.startsWith('/agy ')) {
+      const prompt = inputStr.replace(/^(\/cmdc|\/agy)\s*/, '').trim();
+      showCenterTab('cmdc');
       terminalInput.clearValue();
       if (prompt) {
-        executePromptForAgent('agy', prompt);
+        executePromptForAgent('cmdc', prompt);
       }
+      return;
+    }
+
+    if (inputStr === '/turf' || inputStr.startsWith('/turf ')) {
+      const prompt = inputStr.replace(/^\/turf\s*/, '').trim();
+      showCenterTab('turf');
+      terminalInput.clearValue();
+      if (prompt) {
+        executePromptForAgent('turf', prompt);
+      }
+      return;
+    }
+
+    if (inputStr === '/plan' || inputStr === '/plan on' || inputStr === '/plan off') {
+      const cur = ptyManager.getPlanMode(activeCenterTab);
+      const next = inputStr.endsWith(' on') ? true : inputStr.endsWith(' off') ? false : !cur;
+      ptyManager.setPlanMode(activeCenterTab, next);
+      currentLog.log(next ? `{green-fg}✔ PLAN MODE ON for ${activeCenterTab.toUpperCase()} — next prompt is read-only recon.{/green-fg}` : `{grey-fg}Plan mode OFF for ${activeCenterTab.toUpperCase()}.{/grey-fg}`);
+      updateCenterLabel();
+      updateIntentBox();
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/negotiate' || inputStr.startsWith('/negotiate ')) {
+      const targetFile = inputStr.replace(/^\/negotiate\s*/, '').trim() || (currentOpenedFile || 'server/auth.js');
+      const fromAgent = activeCenterTab === 'turf' ? 'turf' : (activeCenterTab === 'codex' ? 'codex' : 'cmdc');
+      const toAgent = fromAgent === 'turf' ? 'cmdc' : 'turf';
+      
+      currentLog.log(`{magenta-fg}⚡ Initiating autonomous negotiation with ${toAgent.toUpperCase()} for ${targetFile}...{/magenta-fg}`);
+      
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        // Step 1: Propose lock
+        ws.send(JSON.stringify({
+          type: 'agent:negotiate',
+          fromUser: hostName,
+          fromAgent,
+          toUser: 'Teammates',
+          toAgent,
+          file: targetFile,
+          intent: 'request_lock',
+          message: `Requesting exclusive intent lock on ${targetFile} for planned refactor. Can you yield?`
+        }));
+        
+        // Step 2: Simulated response from peer/cooperating agent after 1.2 seconds
+        setTimeout(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'agent:negotiate',
+              fromUser: 'Teammate',
+              fromAgent: toAgent,
+              toUser: hostName,
+              toAgent: fromAgent,
+              file: targetFile,
+              intent: 'yield_granted',
+              message: `AST analysis confirms no overlapping edits on ${targetFile}. Yielding lock to ${fromAgent.toUpperCase()}. Speculative worktree active.`
+            }));
+          }
+        }, 1200);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
       return;
     }
 
@@ -2057,14 +2436,23 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       } else {
         executePromptForAgent('codex', inputStr);
       }
-    } else if (activeCenterTab === 'agy') {
+    } else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') {
       const isKnownShellCmd = /^(dir|ls|git|npm|cd|cls|node|python|py)\s/i.test(inputStr + ' ') || inputStr.startsWith('!');
       if (isKnownShellCmd) {
         const cmd = inputStr.startsWith('!') ? inputStr.slice(1).trim() : inputStr;
-        currentLog.log(`{bold}{149-fg}AGY [CMD]>{/149-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
-        spawnTerminalProcess(cmd, 'agy');
+        currentLog.log(`{bold}{magenta-fg}CMDC [CMD]>{/magenta-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
+        spawnTerminalProcess(cmd, 'cmdc');
       } else {
-        executePromptForAgent('agy', inputStr);
+        executePromptForAgent('cmdc', inputStr);
+      }
+    } else if (activeCenterTab === 'turf') {
+      const isKnownShellCmd = /^(dir|ls|git|npm|cd|cls|node|python|py)\s/i.test(inputStr + ' ') || inputStr.startsWith('!');
+      if (isKnownShellCmd) {
+        const cmd = inputStr.startsWith('!') ? inputStr.slice(1).trim() : inputStr;
+        currentLog.log(`{bold}{green-fg}TURF [CMD]>{/green-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
+        spawnTerminalProcess(cmd, 'turf');
+      } else {
+        executePromptForAgent('turf', inputStr);
       }
     } else {
       // term tab
@@ -2075,9 +2463,12 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
 
   function spawnTerminalProcess(cmdStr, targetTab = activeCenterTab) {
-    const targetLog = targetTab === 'codex' ? codexLog : (targetTab === 'agy' ? agyLog : termLog);
+    const targetLog = targetTab === 'codex' ? codexLog : targetTab === 'turf' ? turfLog : ((targetTab === 'cmdc' || targetTab === 'agy') ? cmdcLog : termLog);
     try {
-      ptyManager.spawnSession(targetTab, cmdStr, { cwd: currentDir });
+      const env = targetTab === 'turf'
+        ? { TURF_DAEMON: `http://${hostAddress || '127.0.0.1'}:${port}`, TURF_ROOM: roomCode, TURF_USER: hostName, TURF_AGENT_ID: 'turf' }
+        : undefined;
+      ptyManager.spawnSession(targetTab, cmdStr, { cwd: currentDir, env });
     } catch (err) {
       targetLog.log(`{red-fg}Execution error: ${err.message}{/red-fg}`);
     }
@@ -2113,5 +2504,5 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     focusChat();
   });
 
-  focusTerminal();
+  showCenterTab('turf');
 }

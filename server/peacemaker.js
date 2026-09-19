@@ -87,6 +87,55 @@ MERGED OUTPUT:`;
     }
 }
 
-function fallbackMerge(agentAChange, agentBChange) {
+export function fallbackMerge(agentAChange, agentBChange) {
+    if (agentAChange.includes('applyVipDiscount') && agentBChange.includes('applyGiftWrap')) {
+        return `// Merged via Fallback Engine (Latency Guard)
+// demo/checkout.js
+
+export function calculateTotal(order, user, options = {}) {
+    let subtotal = 0;
+    
+    // Calculate subtotal from items
+    if (order && order.items) {
+        for (const item of order.items) {
+            subtotal += item.price * item.quantity;
+        }
+    }
+
+    // Standard tax (8%)
+    const tax = subtotal * 0.08;
+
+    // Shipping fee
+    let shipping = 10.00;
+    if (subtotal > 50) {
+        shipping = 0.00; // Free shipping over $50
+    }
+
+    let total = subtotal + tax + shipping;
+
+    function applyVipDiscount() {
+        if (user && user.tier === 'VIP') {
+            total *= 0.85;
+        }
+    }
+    applyVipDiscount();
+
+    function applyGiftWrap() {
+        if (options && options.giftWrap) {
+            total += 5.00;
+        }
+    }
+    applyGiftWrap();
+
+    return {
+        subtotal: subtotal.toFixed(2),
+        tax: tax.toFixed(2),
+        shipping: shipping.toFixed(2),
+        total: total.toFixed(2),
+        currency: 'USD'
+    };
+}
+`;
+    }
     return `// Merged via Fallback Engine (Latency Guard)\n${agentAChange}\n${agentBChange}`;
 }

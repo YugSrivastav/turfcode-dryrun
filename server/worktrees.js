@@ -24,17 +24,15 @@ export function createWorktree(repoPath, roomCode, agentId, baseBranch = 'main')
     return targetPath;
 }
 
-export function removeWorktree(worktreePath) {
+export function removeWorktree(worktreePath, mainRepoPath = '.') {
     if (fs.existsSync(worktreePath)) {
         const targetGitPath = normalizeGitPath(worktreePath);
-        // Find main repo path by running git rev-parse inside the worktree
-        let repoPath = targetGitPath;
         try {
-           const gitDir = execSync(`git rev-parse --git-dir`, { cwd: targetGitPath }).toString().trim();
-           // Workaround, we can just remove worktree using git worktree remove
-           execSync(`git worktree remove -f "${targetGitPath}"`, { cwd: targetGitPath });
+            execSync(`git worktree remove -f "${targetGitPath}"`, { cwd: mainRepoPath, stdio: 'ignore' });
         } catch (e) {
-            fs.rmSync(worktreePath, { recursive: true, force: true });
+            try {
+                fs.rmSync(worktreePath, { recursive: true, force: true });
+            } catch (e2) {}
         }
     }
 }

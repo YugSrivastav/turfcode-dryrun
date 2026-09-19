@@ -3,13 +3,28 @@ import { EventEmitter } from 'events';
 import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
 
 import pkgHeadless from '@xterm/headless';
 const { Terminal } = pkgHeadless;
 import pkgSerialize from '@xterm/addon-serialize';
 const { SerializeAddon } = pkgSerialize;
+import { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from './model_discovery.js';
 
 const require = createRequire(import.meta.url);
+
+// Repo root (server/pty_manager.js -> repo root) for the built-in turf wrapper.
+const TURF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const TURF_WRAPPER = path.join(TURF_ROOT, 'bin', 'turf-agent.js');
+
+function resolveTurf() {
+  // Prefer a globally installed `turf` binary, fall back to the built-in wrapper.
+  const global = findBinary('turf');
+  if (global) return { file: global, prefix: [] };
+  if (fs.existsSync(TURF_WRAPPER)) return { file: process.execPath, prefix: [TURF_WRAPPER] };
+  return null;
+}
 
 let ptyModule = null;
 try {
@@ -27,6 +42,16 @@ export function findBinary(name) {
     } catch (e) {}
 
     const localAppData = process.env.LOCALAPPDATA || '';
+    const appData = process.env.APPDATA || '';
+
+    if (name === 'cmdc' || name === 'command-code') {
+      const npmCmdc = path.join(appData, 'npm', 'cmdc.cmd');
+      if (fs.existsSync(npmCmdc)) return npmCmdc;
+      const npmCmd = path.join(appData, 'npm', 'cmd.cmd');
+      if (fs.existsSync(npmCmd)) return npmCmd;
+      const npmCommandCode = path.join(appData, 'npm', 'command-code.cmd');
+      if (fs.existsSync(npmCommandCode)) return npmCommandCode;
+    }
     if (name === 'agy') {
       const agyPath = path.join(localAppData, 'agy', 'bin', 'agy.exe');
       if (fs.existsSync(agyPath)) return agyPath;
@@ -34,6 +59,10 @@ export function findBinary(name) {
     if (name === 'codex') {
       const codexPath = path.join(localAppData, 'Programs', 'OpenAI', 'Codex', 'bin', 'codex.exe');
       if (fs.existsSync(codexPath)) return codexPath;
+    }
+    if (name === 'turf') {
+      const turfPath = path.join(localAppData, 'turf', 'bin', 'turf.exe');
+      if (fs.existsSync(turfPath)) return turfPath;
     }
   } else {
     try {
@@ -44,6 +73,8 @@ export function findBinary(name) {
   }
   return null;
 }
+
+export { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab };
 
 export function safeEscape(str) {
   if (!str) return '';
@@ -103,71 +134,188 @@ export function parseCodexJsonLine(line, config, emit) {
   }
 }
 
-export function parseAgyJsonLine(line, config, emit) {
+export function parseCmdcJsonLine(line, config, emit) {
   if (!line || !line.trim()) return;
   try {
     const data = JSON.parse(line);
-    if ((data.event === 'init' || data.event === 'session_started') && data.conversation_id) {
-      config.sessionId = data.conversation_id;
-      emit('agent:msg', { tabId: 'agy', type: 'session', text: `{bold}{149-fg}⚡ [Session ID:{/149-fg}{/bold} {yellow-fg}${safeEscape(data.conversation_id.slice(0, 18))}...{/yellow-fg}{bold}{149-fg}]{/149-fg}{/bold}` });
-    } else if (data.event === 'step_update' && data.step_update) {
-      const su = data.step_update;
-      if (su.conversation_id && !config.sessionId) config.sessionId = su.conversation_id;
+    const event = data.event || data;
+    const type = event.type || data.type;
 
-      if (su.step_type === 'tool' && su.state === 'ACTIVE') {
-        const tName = su.tool_name || (su.tool_info && su.tool_info.name) || 'tool';
-        const p = su.tool_info && su.tool_info.parameters ? su.tool_info.parameters : {};
-        if (tName === 'run_command' && p.CommandLine) {
-          emit('agent:msg', { tabId: 'agy', type: 'tool', text: `{white-fg}⚙️ [Run]{/white-fg} {yellow-fg}${safeEscape(p.CommandLine.slice(0, 85))}{/yellow-fg}` });
-        } else if (tName === 'view_file') {
-          const fn = path.basename(p.TargetFile || p.AbsolutePath || '');
-          emit('agent:msg', { tabId: 'agy', type: 'tool', text: `{white-fg}📖 [Read File]{/white-fg} {cyan-fg}${safeEscape(fn)}{/cyan-fg}` });
-        } else if (tName === 'replace_file_content' || tName === 'write_to_file') {
-          const fn = path.basename(p.TargetFile || '');
-          emit('agent:msg', { tabId: 'agy', type: 'tool', text: `{white-fg}✏️ [Edit File]{/white-fg} {green-fg}${safeEscape(fn)}{/green-fg}` });
-        } else if (tName === 'grep_search' || tName === 'find_by_name') {
-          emit('agent:msg', { tabId: 'agy', type: 'tool', text: `{white-fg}🔍 [Search Code]{/white-fg} {yellow-fg}${safeEscape(p.Query || p.Pattern || '')}{/yellow-fg}` });
-        } else {
-          emit('agent:msg', { tabId: 'agy', type: 'tool', text: `{white-fg}🔧 [${safeEscape(tName)}]{/white-fg}` });
-        }
-        emit('status', { tabId: 'agy', status: 'working', details: tName });
-      } else if (su.step_type === 'agent_response') {
-        if (su.text_delta) {
-          config.hasStreamedResponse = true;
-          emit('agent:stream', { tabId: 'agy', text: su.text_delta });
-        }
-        if (su.state === 'ACTIVE') {
-          emit('status', { tabId: 'agy', status: 'working', details: 'Responding' });
-        } else if (su.state === 'DONE' && su.usage) {
-          config.totalTokens += (su.usage.total_tokens || 0);
-        }
+    if (type === 'run_start' && (event.sessionId || data.sessionId)) {
+      const sid = event.sessionId || data.sessionId;
+      config.sessionId = sid;
+      emit('agent:msg', { tabId: 'cmdc', type: 'session', text: `{bold}{magenta-fg}⚡ [Session ID:{/magenta-fg}{/bold} {yellow-fg}${safeEscape(sid.slice(0, 18))}...{/yellow-fg}{bold}{magenta-fg}]{/magenta-fg}{/bold}` });
+    } else if (type === 'turn_start') {
+      emit('status', { tabId: 'cmdc', status: 'working', details: 'Thinking' });
+    } else if (type === 'model_request_start' && event.model) {
+      emit('status', { tabId: 'cmdc', status: 'working', details: String(event.model).slice(0, 16) });
+    } else if (type === 'text_delta' && event.delta) {
+      config.hasStreamedResponse = true;
+      emit('agent:stream', { tabId: 'cmdc', text: event.delta });
+    } else if (type === 'tool_call' || type === 'tool_use') {
+      const tool = event.tool || event.name || 'tool';
+      let badge = '{magenta-fg}🔧 [Tool]{/magenta-fg}';
+      let detail = event.command || event.path || event.query || (typeof event.input === 'string' ? event.input : JSON.stringify(event.input || ''));
+      if (tool === 'run' || tool === 'bash' || tool === 'execute') {
+        badge = '{white-fg}⚙️ [Run]{/white-fg}';
+      } else if (tool === 'read' || tool === 'view_file') {
+        badge = '{cyan-fg}📖 [Read File]{/cyan-fg}';
+      } else if (tool === 'write' || tool === 'edit') {
+        badge = '{green-fg}✏️ [Edit File]{/green-fg}';
+      } else if (tool === 'grep' || tool === 'find') {
+        badge = '{yellow-fg}🔍 [Search]{/yellow-fg}';
       }
-    } else if (data.event === 'result' && data.result) {
-      const res = data.result;
-      if (res.conversation_id && !config.sessionId) config.sessionId = res.conversation_id;
-      if (res.response && !config.hasStreamedResponse) {
-        emit('agent:msg', { tabId: 'agy', type: 'message', text: `{bold}{149-fg}💬 Antigravity:{/149-fg}{/bold}\n${safeEscape(res.response.trim())}` });
+      emit('agent:msg', { tabId: 'cmdc', type: 'tool', text: `${badge} {yellow-fg}${safeEscape(String(detail).slice(0, 85))}{/yellow-fg}` });
+      emit('status', { tabId: 'cmdc', status: 'working', details: tool.slice(0, 16) });
+    } else if (type === 'message_end' && event.content && !config.hasStreamedResponse) {
+      const text = Array.isArray(event.content) ? event.content.map(c => c.text || '').join('') : (event.content || '');
+      if (String(text).trim()) {
+        emit('agent:msg', { tabId: 'cmdc', type: 'message', text: `{bold}{magenta-fg}💬 Command Code:{/magenta-fg}{/bold}\n${safeEscape(String(text).trim())}` });
       }
+    } else if (type === 'run_end' || data.type === 'result') {
+      const usage = event.usage || (data.result && data.result.usage) || data.usage;
+      const tokens = usage ? (usage.inputTokens || 0) + (usage.outputTokens || 0) : 0;
+      config.totalTokens += tokens;
       config.hasStreamedResponse = false;
-      if (res.error || res.status === 'ERROR') {
-        const errStr = res.error || 'Execution encountered an error';
-        let tip = '';
-        if (errStr.includes('429') || errStr.includes('RESOURCE_EXHAUSTED')) {
-          tip = '\n{yellow-fg}💡 Tip: Rate limit exhausted (429). Try switching model: /model gemini-3.8-flash-high or /model gemini-3.7-flash-high or /model claude-sonnet-4-6{/yellow-fg}';
-        }
-        emit('agent:msg', { tabId: 'agy', type: 'error', text: `{bold}{red-fg}❌ Antigravity Error: ${safeEscape(errStr)}{/red-fg}{/bold}${tip}` });
-        emit('status', { tabId: 'agy', status: 'idle', details: 'Error' });
+      if (data.subtype === 'error' || event.subtype === 'error') {
+        const errText = data.error || event.error || (data.result && data.result.error) || 'Command Code execution error';
+        emit('agent:msg', { tabId: 'cmdc', type: 'error', text: `{bold}{red-fg}❌ Command Code Error: ${safeEscape(errText)}{/red-fg}{/bold}` });
+        emit('status', { tabId: 'cmdc', status: 'idle', details: 'Error' });
       } else {
-        const tokens = res.usage ? res.usage.total_tokens : 0;
-        emit('agent:msg', { tabId: 'agy', type: 'done', text: `{bold}{green-fg}✓ [Antigravity Turn #${config.turnCount} Complete]{/green-fg}{/bold} {white-fg}│ Tokens: ${(tokens || 0).toLocaleString()}{/white-fg}` });
-        emit('status', { tabId: 'agy', status: 'done', details: 'Done' });
+        emit('agent:msg', { tabId: 'cmdc', type: 'done', text: `{bold}{green-fg}✓ [Command Code Turn #${config.turnCount} Complete]{/green-fg}{/bold} {white-fg}│ Tokens: ${tokens.toLocaleString()}{/white-fg}` });
+        emit('status', { tabId: 'cmdc', status: 'done', details: 'Done' });
       }
     }
   } catch (e) {
     const clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').trim();
-    if (clean && !clean.startsWith('[?') && !clean.startsWith('npm exec') && clean !== 'default' && clean !== 'true' && clean !== 'false') {
-      emit('agent:msg', { tabId: 'agy', type: 'raw', text: `{white-fg}${safeEscape(clean)}{/white-fg}` });
+    if (clean && !clean.startsWith('[?') && clean !== 'default' && clean !== 'true' && clean !== 'false') {
+      emit('agent:msg', { tabId: 'cmdc', type: 'raw', text: `{white-fg}${safeEscape(clean)}{/white-fg}` });
     }
+  }
+}
+
+export function parseAgyJsonLine(line, config, emit) {
+  parseCmdcJsonLine(line, config, emit);
+}
+
+function turfMessageText(message) {
+  if (!message) return '';
+  const content = message.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b && (b.type === 'text' || typeof b.text === 'string'))
+      .map((b) => b.text || '')
+      .join('');
+  }
+  return '';
+}
+
+function turfAddUsage(config, usage) {
+  if (!usage || typeof usage !== 'object') return;
+  const n = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  // Pi reports usage.totalTokens; fall back to input+output sum for other shapes
+  const tokens = n(usage.totalTokens) || (n(usage.input) + n(usage.input_tokens) + n(usage.output) + n(usage.output_tokens));
+  if (tokens > 0) config.totalTokens += tokens;
+}
+
+export function parseTurfJsonLine(line, config, emit) {
+  if (!line || !line.trim()) return;
+  let data;
+  try {
+    data = JSON.parse(line);
+  } catch (e) {
+    const clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').trim();
+    if (!clean || clean.startsWith('[?') || clean.startsWith('npm exec')) return;
+
+    // Check for 401 authentication error line e.g. `401 {"type":"error",...}`
+    if (clean.includes('401') || clean.includes('authentication_error') || clean.includes('invalid x-api-key') || clean.includes('invalid_api_key')) {
+      config.lastTurnFailed = true;
+      emit('agent:msg', {
+        tabId: 'turf',
+        type: 'error',
+        text: `{bold}{red-fg}❌ Turf Authentication Error (401): Missing or invalid API key.{/red-fg}{/bold}\n{yellow-fg}💡 Tip: Add GEMINI_API_KEY, GROQ_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY to your .env or environment.{/yellow-fg}`
+      });
+      emit('status', { tabId: 'turf', status: 'idle', details: 'Auth Error' });
+      return;
+    }
+
+    // Check for 429 rate limit error
+    if (clean.includes('429') || clean.toLowerCase().includes('rate_limit') || clean.toLowerCase().includes('tokens per minute')) {
+      config.lastTurnFailed = true;
+      emit('agent:msg', {
+        tabId: 'turf',
+        type: 'error',
+        text: `{bold}{red-fg}❌ Turf Rate Limit (429): Token limit reached on current provider.{/red-fg}{/bold}\n{yellow-fg}💡 Tip: Free Groq keys have a 20,000 TPM limit. Use Google Gemini Studio (1,000,000 TPM) or configure an Anthropic/OpenAI key.{/yellow-fg}`
+      });
+      emit('status', { tabId: 'turf', status: 'idle', details: 'Rate Limit' });
+      return;
+    }
+
+    // Suppress standalone raw UUID session IDs from dumping into UI
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(clean)) {
+      if (!config.sessionId) config.sessionId = clean;
+      return;
+    }
+
+    emit('agent:msg', { tabId: 'turf', type: 'raw', text: `{grey-fg}${safeEscape(clean)}{/grey-fg}` });
+    return;
+  }
+  if (!data || typeof data !== 'object') return;
+
+  if (data.type === 'session' && data.id) {
+    config.sessionId = data.id;
+    emit('agent:msg', { tabId: 'turf', type: 'session', text: `{grey-fg}Session ID: {yellow-fg}${safeEscape(String(data.id))}{/yellow-fg}{/grey-fg}` });
+  } else if (data.type === 'turn_start') {
+    config.lastTurnFailed = false;
+    config.hasStreamedResponse = false;
+    emit('status', { tabId: 'turf', status: 'working', details: 'Thinking' });
+  } else if (data.type === 'message_update') {
+    turfAddUsage(config, data.usage);
+    const ev = data.assistantMessageEvent;
+    if (ev) {
+      const delta = ev.delta || ev.text || (typeof ev.content === 'string' ? ev.content : '');
+      if (delta && (ev.type === 'text_delta' || ev.event === 'text_delta' || !ev.type)) {
+        config.hasStreamedResponse = true;
+        emit('agent:stream', { tabId: 'turf', text: delta });
+      } else if (delta && (ev.type === 'thought_delta' || ev.type === 'thinking_delta' || ev.event === 'thought_delta')) {
+        emit('agent:stream', { tabId: 'turf', text: `{grey-fg}${safeEscape(delta)}{/grey-fg}` });
+      }
+    }
+  } else if (data.type === 'message_end' && data.message && data.message.role === 'assistant') {
+    const text = turfMessageText(data.message).trim();
+    if (text) {
+      emit('agent:msg', { tabId: 'turf', type: 'message', text: `{bold}{green-fg}Turf:{/green-fg}{/bold}\n${safeEscape(text)}` });
+    } else if (data.message.errorMessage) {
+      config.lastTurnFailed = true;
+      const errStr = String(data.message.errorMessage);
+      let advice = '';
+      if (errStr.includes('429') || errStr.toLowerCase().includes('rate limit')) {
+        advice = '\n{yellow-fg}💡 Tip: Free Groq keys have a 20,000 TPM limit. Switch to Google Gemini Studio for 1,000,000 TPM limit.{/yellow-fg}';
+      }
+      emit('agent:msg', { tabId: 'turf', type: 'error', text: `{bold}{red-fg}❌ Turf Error: ${safeEscape(errStr.slice(0, 300))}{/red-fg}{/bold}${advice}` });
+      emit('status', { tabId: 'turf', status: 'idle', details: 'Error' });
+    }
+    config.hasStreamedResponse = false;
+  } else if (data.type === 'tool_execution_start' && data.toolName) {
+    const name = String(data.toolName);
+    let badge = '{grey-fg}⚙️ [Run]{/grey-fg}';
+    if (/^(read)$/i.test(name)) badge = '{grey-fg}📖 [Read File]{/grey-fg}';
+    else if (/^(write|edit)$/i.test(name)) badge = '{grey-fg}✏️ [Edit File]{/grey-fg}';
+    else if (/^(grep|find|ls)$/i.test(name)) badge = '{grey-fg}🔍 [Search]{/grey-fg}';
+    const arg = data.args && (data.args.path || data.args.command || data.args.pattern || '');
+    emit('agent:msg', { tabId: 'turf', type: 'tool', text: `${badge} {white-fg}${safeEscape(String(arg).slice(0, 85))}{/white-fg}` });
+    emit('status', { tabId: 'turf', status: 'working', details: name.slice(0, 16) });
+  } else if (data.type === 'tool_execution_end' && data.isError) {
+    const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result || 'tool failed');
+    emit('agent:msg', { tabId: 'turf', type: 'error', text: `{red-fg}${safeEscape(result.slice(0, 300))}{/red-fg}` });
+  } else if (data.type === 'agent_end') {
+    config.hasStreamedResponse = false;
+    if (!config.lastTurnFailed) {
+      emit('agent:msg', { tabId: 'turf', type: 'done', text: `{bold}{green-fg}✓ [Turf Turn #${config.turnCount} Complete]{/green-fg}{/bold} {grey-fg}│ Tokens: ${config.totalTokens.toLocaleString()}{/grey-fg}` });
+      emit('status', { tabId: 'turf', status: 'done', details: 'Done' });
+    }
+    config.lastTurnFailed = false;
   }
 }
 
@@ -189,14 +337,32 @@ export class PtyManager extends EventEmitter {
       sandbox: 'workspace-write',
       totalTokens: 0
     });
-    this.agentConfigs.set('agy', {
+    this.agentConfigs.set('cmdc', {
       sessionId: null,
       turnCount: 0,
-      model: 'gemini-3.8-flash-high',
+      model: 'default',
       effort: 'medium',
       sandbox: 'workspace-write',
       totalTokens: 0,
-      hasStreamedResponse: false
+      planMode: false
+    });
+    this.agentConfigs.set('agy', {
+      sessionId: null,
+      turnCount: 0,
+      model: 'default',
+      effort: 'medium',
+      sandbox: 'workspace-write',
+      totalTokens: 0,
+      planMode: false
+    });
+    this.agentConfigs.set('turf', {
+      sessionId: null,
+      turnCount: 0,
+      model: 'default',
+      effort: 'medium',
+      sandbox: 'workspace-write',
+      totalTokens: 0,
+      planMode: false
     });
     this.agentConfigs.set('term', {
       sessionId: null,
@@ -224,7 +390,8 @@ export class PtyManager extends EventEmitter {
         model: 'default',
         effort: 'medium',
         sandbox: 'workspace-write',
-        totalTokens: 0
+        totalTokens: 0,
+        planMode: false
       });
     }
     return this.agentConfigs.get(tabId);
@@ -288,8 +455,19 @@ export class PtyManager extends EventEmitter {
       model: config.model,
       effort: config.effort,
       sandbox: config.sandbox,
-      totalTokens: config.totalTokens
+      totalTokens: config.totalTokens,
+      planMode: !!config.planMode
     };
+  }
+
+  setPlanMode(tabId, enabled) {
+    const config = this.getAgentConfig(tabId);
+    config.planMode = !!enabled;
+    return config.planMode;
+  }
+
+  getPlanMode(tabId) {
+    return !!this.getAgentConfig(tabId).planMode;
   }
 
   getStatus(tabId) {
@@ -321,6 +499,13 @@ export class PtyManager extends EventEmitter {
     const rows = options.rows || 28;
     const env = {
       ...process.env,
+      ...(() => {
+        const p = path.join(cwd, '.env');
+        if (fs.existsSync(p)) {
+          try { return dotenv.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
+        }
+        return {};
+      })(),
       ...(options.env || {}),
       TERM: 'xterm-256color',
       COLORTERM: 'truecolor',
@@ -376,34 +561,89 @@ export class PtyManager extends EventEmitter {
         args.push(prompt);
       }
       config.turnCount++;
-    } else if (tabId === 'agy') {
-      const bin = findBinary('agy');
+    } else if (tabId === 'cmdc' || tabId === 'agy') {
+      const appData = process.env.APPDATA || '';
+      const mjsPath = isWin ? path.join(appData, 'npm', 'node_modules', 'command-code', 'dist', 'index.mjs') : null;
+      let bin = (mjsPath && fs.existsSync(mjsPath)) ? mjsPath : (findBinary('cmdc') || findBinary('command-code') || findBinary('agy'));
       if (!bin) {
-        throw new Error('Antigravity (agy) CLI is not installed or not in PATH.');
+        throw new Error('Command Code (cmdc) CLI is not installed or not in PATH.');
       }
-      file = bin;
-      const config = this.getAgentConfig('agy');
+      const config = this.getAgentConfig(tabId);
       const prompt = inputCmd ? inputCmd.trim() : '';
 
       if (!prompt) {
         return null;
       }
 
-      args = ['-p', prompt, '--output-format', 'stream-json', '--dangerously-skip-permissions', '--disable-slash-commands'];
+      if (bin.endsWith('.mjs') || bin.endsWith('.js')) {
+        file = process.execPath;
+        args = [bin, '-p', prompt, '--output-format', 'json', '--trust'];
+      } else {
+        file = bin;
+        args = ['-p', prompt, '--output-format', 'json', '--trust'];
+      }
+
       if (config.sessionId) {
-        args.push('--conversation', config.sessionId);
+        args.push('--resume', config.sessionId);
       } else if (config.turnCount > 0) {
         args.push('-c');
       }
 
-      // Always pass modern high-quota model for Antigravity (default to gemini-3.8-flash-high)
-      const agyModel = (config.model && config.model !== 'default') ? config.model : 'gemini-3.8-flash-high';
-      args.push('--model', agyModel);
-
-      if (config.effort && config.effort !== 'medium') {
-        args.push('--effort', config.effort);
+      if (config.model && config.model !== 'default') {
+        args.push('--model', config.model);
       }
-      config.hasStreamedResponse = false;
+
+      if (config.planMode) {
+        args.push('--mode', 'plan');
+      }
+      config.turnCount++;
+    } else if (tabId === 'turf') {
+      const resolved = resolveTurf();
+      if (!resolved) {
+        throw new Error('Turf agent is not installed. Run `npm install` in the turfcode repo first.');
+      }
+      file = resolved.file;
+      const config = this.getAgentConfig('turf');
+      const prompt = inputCmd ? inputCmd.trim() : '';
+
+      if (!prompt) {
+        return null;
+      }
+
+      // Pi-native flags: --mode json event stream, -c/--session resume,
+      // --thinking effort, --tools allowlist as the read-only/plan gate.
+      args = [...resolved.prefix, '--mode', 'json'];
+      if (config.sessionId) {
+        args.push('--session', config.sessionId);
+      } else if (config.turnCount > 0) {
+        args.push('-c');
+      }
+
+      if (config.model && config.model !== 'default') {
+        const m = config.model;
+        if ((m.startsWith('llama') || m.includes('qwen') || m.includes('gpt-oss') || m.includes('compound')) && !m.includes('/')) {
+          args.push('--provider', 'groq', '--model', m);
+        } else if ((m.startsWith('gemini') || m.startsWith('gemma')) && !m.includes('/')) {
+          args.push('--provider', 'google', '--model', m);
+        } else {
+          args.push('--model', m);
+        }
+      } else if (env.GEMINI_API_KEY && (!env.GROQ_API_KEY || config.lastTurnFailed)) {
+        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+      } else if (!env.ANTHROPIC_API_KEY && env.GROQ_API_KEY) {
+        args.push('--provider', 'groq', '--model', 'openai/gpt-oss-120b');
+      } else if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
+        args.push('--provider', 'openai', '--model', 'gpt-4o');
+      } else if (!env.ANTHROPIC_API_KEY && env.GEMINI_API_KEY) {
+        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+      }
+      if (config.effort && config.effort !== 'medium') {
+        args.push('--thinking', config.effort);
+      }
+      if (config.planMode || config.sandbox === 'read-only') {
+        args.push('--tools', 'read,grep,find,ls');
+      }
+      args.push(prompt);
       config.turnCount++;
     } else {
       // Shell / Terminal tab
@@ -416,7 +656,7 @@ export class PtyManager extends EventEmitter {
       }
     }
 
-    const isAgentTab = (tabId === 'codex' || tabId === 'agy');
+    const isAgentTab = (tabId === 'codex' || tabId === 'cmdc' || tabId === 'agy' || tabId === 'turf');
     let proc = null;
     let isPty = false;
 
@@ -519,8 +759,10 @@ export class PtyManager extends EventEmitter {
         for (const line of lines) {
           if (tabId === 'codex') {
             parseCodexJsonLine(line, config, (ev, pl) => this.emit(ev, pl));
-          } else if (tabId === 'agy') {
-            parseAgyJsonLine(line, config, (ev, pl) => this.emit(ev, pl));
+          } else if (tabId === 'cmdc' || tabId === 'agy') {
+            parseCmdcJsonLine(line, config, (ev, pl) => this.emit(ev, pl));
+          } else if (tabId === 'turf') {
+            parseTurfJsonLine(line, config, (ev, pl) => this.emit(ev, pl));
           }
         }
         this.emit('data', { tabId, data: chunk.toString() });
@@ -532,30 +774,8 @@ export class PtyManager extends EventEmitter {
           return;
         }
 
-        if (tabId === 'agy') {
-          // Antigravity (Google Cloud Code) network / DNS failure check
-          if (text.includes('no such host') || text.includes('lookup cloudcode') || text.includes('Eligibility check failed') || text.includes('dial tcp')) {
-            this.emit('agent:msg', {
-              tabId: 'agy',
-              type: 'error',
-              text: `{bold}{red-fg}📡 Antigravity Network Error: Unable to reach Google Cloud Code (DNS/Internet disconnected).{/red-fg}{/bold}\n{yellow-fg}💡 Check your internet connection and try again.{/yellow-fg}`
-            });
-            this.emit('status', { tabId: 'agy', status: 'idle', details: 'Network Error' });
-            return;
-          }
-
-          // Antigravity rate limit / quota exhaustion check
-          if (text.includes('RESOURCE_EXHAUSTED') || text.includes('429')) {
-            this.emit('agent:msg', {
-              tabId: 'agy',
-              type: 'error',
-              text: `{bold}{red-fg}⚠️ Antigravity Rate limit reached (429 Resource Exhausted).{/red-fg}{/bold}\n{yellow-fg}💡 Tip: Switch model with /model (e.g. /model gemini-3.8-flash-high or /model gemini-3.7-flash-high or /model claude-sonnet-4-6){/yellow-fg}`
-            });
-            this.emit('status', { tabId: 'agy', status: 'idle', details: 'Rate Limit' });
-            return;
-          }
-
-          this.emit('agent:msg', { tabId: 'agy', type: 'error', text: `{red-fg}${safeEscape(text)}{/red-fg}` });
+        if (tabId === 'cmdc' || tabId === 'agy') {
+          this.emit('agent:msg', { tabId, type: 'error', text: `{red-fg}${safeEscape(text)}{/red-fg}` });
         } else if (tabId === 'codex') {
           // OpenAI Codex network / websocket DNS failure check
           if (text.includes('No such host is known') || text.includes('failed to connect to websocket') || text.includes('os error 11001')) {
@@ -596,7 +816,8 @@ export class PtyManager extends EventEmitter {
       proc.on('close', (exitCode) => {
         if (lineBuf && lineBuf.trim()) {
           if (tabId === 'codex') parseCodexJsonLine(lineBuf, config, (ev, pl) => this.emit(ev, pl));
-          else if (tabId === 'agy') parseAgyJsonLine(lineBuf, config, (ev, pl) => this.emit(ev, pl));
+          else if (tabId === 'cmdc' || tabId === 'agy') parseCmdcJsonLine(lineBuf, config, (ev, pl) => this.emit(ev, pl));
+          else if (tabId === 'turf') parseTurfJsonLine(lineBuf, config, (ev, pl) => this.emit(ev, pl));
         }
       });
     } else {

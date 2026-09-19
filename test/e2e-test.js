@@ -2,11 +2,17 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import blessed from 'blessed';
-import { spawnHostDaemon } from '../server/index.js';
+import { spawnHostDaemon, getLocalIp } from '../server/index.js';
+import { lockRegistry } from '../server/locks.js';
 import { buildFileTree, flattenFileTree, formatTreeNode, getProjectFiles, getTruncatedPath } from '../server/tui.js';
-import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseAgyJsonLine } from '../server/pty_manager.js';
+import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
+import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from '../server/pty_manager.js';
+import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
+import { getGroqApiKeys, getNextGroqApiKey } from '../server/model_discovery.js';
+import { verifyCode, extractAstSymbols } from '../server/verify.js';
 import WebSocket from 'ws';
-import { execSync } from 'child_process';
+import os from 'os';
+import { execSync, execFile } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -30,9 +36,10 @@ async function runTests() {
   // A. Syntax Verification
   console.log('\n--- Checking Syntax ---');
   const files = [
-    'bin/turf.js', 'server/tui.js', 'server/index.js', 
+    'bin/turf.js', 'bin/turf-agent.js', 'server/tui.js', 'server/index.js', 
     'server/events.js', 'server/rooms.js', 'server/locks.js',
-    'server/pty_manager.js'
+    'server/pty_manager.js', 'server/model_discovery.js', 'server/sync.js',
+    'server/verify.js'
   ];
   for (const file of files) {
     try {
@@ -94,6 +101,116 @@ async function runTests() {
   assert(chatMessageReceived, 'Chat message broadcasted and received');
   assert(agentStatusReceived, 'Agent status broadcasted and received across WebSocket');
 
+  // P1. Peer-to-Peer Workspace Sync via Tarball Streaming
+  console.log('\n--- Testing P1: Peer-to-Peer Workspace Sync Tarball ---');
+  const testSyncDir = path.join(os.tmpdir(), `turf_test_sync_${Date.now()}`);
+  const testUnpackDir = path.join(os.tmpdir(), `turf_test_unpack_${Date.now()}`);
+  fs.mkdirSync(path.join(testSyncDir, 'sub'), { recursive: true });
+  fs.writeFileSync(path.join(testSyncDir, 'hello.txt'), 'Hello Turfcode Sync!');
+  fs.writeFileSync(path.join(testSyncDir, 'sub', 'nested.js'), 'export const x = 42;');
+
+  const tarGz = packDirectoryToTarGz(testSyncDir);
+  assert(Buffer.isBuffer(tarGz) && tarGz.length > 0, 'packDirectoryToTarGz creates valid gzip buffer');
+
+  const unpackedFiles = unpackTarGzToDirectory(tarGz, testUnpackDir);
+  assert(unpackedFiles.some(f => f.includes('hello.txt')), 'unpackTarGzToDirectory extracts root files');
+  assert(fs.existsSync(path.join(testUnpackDir, 'hello.txt')), 'unpacked file exists on disk');
+  assert(fs.readFileSync(path.join(testUnpackDir, 'hello.txt'), 'utf8') === 'Hello Turfcode Sync!', 'unpacked content matches original');
+
+  const syncRes = await fetch(`http://127.0.0.1:${actualPort}/api/room/sync`);
+  assert(syncRes.status === 200, 'GET /api/room/sync returns 200 OK');
+  assert(syncRes.headers.get('content-type') === 'application/gzip', 'GET /api/room/sync serves application/gzip');
+  const syncBuf = Buffer.from(await syncRes.arrayBuffer());
+  assert(syncBuf.length > 0, 'GET /api/room/sync returns non-empty tarball');
+
+  try {
+    fs.rmSync(testSyncDir, { recursive: true, force: true });
+    fs.rmSync(testUnpackDir, { recursive: true, force: true });
+  } catch (e) {}
+
+  // P2. Babel AST Semantic Verification in verify.js
+  console.log('\n--- Testing P2: Babel AST Stage in verify.js ---');
+  const codeA = 'export function calculateTotal(subtotal) { return subtotal * 1.1; }';
+  const codeB = 'export function applyDiscount(total) { return total - 5; }';
+  const mergedValid = 'export function calculateTotal(subtotal) { return subtotal * 1.1; }\nexport function applyDiscount(total) { return total - 5; }';
+  const validRes = verifyCode(mergedValid, codeA, codeB);
+  assert(validRes.valid === true, 'verifyCode returns valid: true for clean merge');
+  assert(validRes.astAudit.passed === true, 'Babel AST stage passes on valid syntax');
+  assert(validRes.astAudit.exports.includes('calculateTotal'), 'Babel AST extracts calculateTotal export');
+  assert(validRes.astAudit.exports.includes('applyDiscount'), 'Babel AST extracts applyDiscount export');
+
+  const codeWithExport = 'export function criticalAuthGuard() { return true; }';
+  const mergedDroppedExport = 'function criticalAuthGuard() { return true; }';
+  const brokenRes = verifyCode(mergedDroppedExport, codeWithExport, '');
+  assert(brokenRes.valid === false, 'verifyCode detects dropped export');
+  assert(brokenRes.astAudit.passed === false, 'astAudit flags dropped export');
+  assert(brokenRes.astAudit.missingExports.includes('criticalAuthGuard'), 'missingExports lists criticalAuthGuard');
+
+  const brokenSyntax = 'function broken( { return; }';
+  const syntaxErrRes = verifyCode(brokenSyntax, '', '');
+  assert(syntaxErrRes.valid === false, 'verifyCode catches invalid syntax');
+  assert(syntaxErrRes.errors.length > 0, 'verifyCode reports syntax/AST error details');
+
+  // P3. Live WebSocket Data & Static Client Distribution
+  console.log('\n--- Testing P3: Live WS Data in Web Client & Static Serving ---');
+  const distHtmlPath = path.join(TURF_ROOT, 'client/dist/index.html');
+  assert(fs.existsSync(distHtmlPath), 'client/dist/index.html exists for web client serving');
+  const clientHtmlRes = await fetch(`http://127.0.0.1:${actualPort}/`);
+  assert(clientHtmlRes.status === 200, 'Host daemon serves static index.html at GET /');
+  const clientHtml = await clientHtmlRes.text();
+  assert(clientHtml.includes('<!doctype html>') && clientHtml.includes('root'), 'Static index.html contains React root mount');
+
+  // Verify full real-time WebSocket protocol handling in web client
+  let clientWsOpened = false;
+  let clientReceivedChat = false;
+  let clientReceivedPeacemakerDiff = false;
+
+  const clientWs = new WebSocket(`ws://127.0.0.1:${actualPort}`);
+  clientWs.on('open', () => {
+    clientWsOpened = true;
+    clientWs.send(JSON.stringify({
+      type: 'peer:join',
+      user: 'WebClientUser',
+      role: 'Spectator',
+      room: room.code
+    }));
+  });
+
+  clientWs.on('message', (raw) => {
+    const msg = JSON.parse(raw);
+    if (msg.type === 'chat:message' && msg.user === 'WebClientUser') {
+      clientReceivedChat = true;
+    }
+    if (msg.type === 'peacemaker:diff') {
+      clientReceivedPeacemakerDiff = true;
+    }
+  });
+
+  await new Promise(resolve => setTimeout(resolve, 300));
+  assert(clientWsOpened, 'Web client connects to daemon WebSocket');
+
+  // Send a chat message from web client
+  clientWs.send(JSON.stringify({
+    type: 'chat:send',
+    user: 'WebClientUser',
+    message: 'Testing live chat from web client'
+  }));
+
+  // Broadcast a peacemaker diff
+  clientWs.send(JSON.stringify({
+    type: 'peacemaker:diff',
+    file: 'demo/checkout.js',
+    agentA: { name: 'Yug', agent: 'agy', code: 'const a = 1;' },
+    agentB: { name: 'Ayush', agent: 'claude', code: 'const b = 2;' },
+    merged: 'const a = 1;\nconst b = 2;',
+    astAudit: { passed: true }
+  }));
+
+  await new Promise(resolve => setTimeout(resolve, 500));
+  assert(clientReceivedChat, 'Web client receives broadcasted chat');
+  assert(clientReceivedPeacemakerDiff, 'Web client receives peacemaker:diff resolution');
+  clientWs.close();
+
   // C. File Explorer & Tree Logic Verification
   console.log('\n--- Testing File Explorer & Tree Logic ---');
   const tree = buildFileTree(TURF_ROOT);
@@ -143,6 +260,14 @@ async function runTests() {
   // Test backward-compatible getProjectFiles
   const legacyFiles = getProjectFiles(TURF_ROOT);
   assert(legacyFiles.includes('server/tui.js') && legacyFiles.includes('bin/turf.js'), 'getProjectFiles returns all files');
+
+  // Test normalizeAndValidatePath handling of spaces, quotes and normal paths
+  const normDot = await normalizeAndValidatePath('.', () => Promise.resolve('n'));
+  assert(normDot === path.resolve('.'), 'normalizeAndValidatePath handles dot directory');
+  const normQuoted = await normalizeAndValidatePath(`"${path.resolve('.')}"`, () => Promise.resolve('n'));
+  assert(normQuoted === path.resolve('.'), 'normalizeAndValidatePath strips surrounding double quotes');
+  const normSpaced = await normalizeAndValidatePath(`  '${path.resolve('.')}'  `, () => Promise.resolve('n'));
+  assert(normSpaced === path.resolve('.'), 'normalizeAndValidatePath strips surrounding single quotes and whitespace');
 
   // D. Double Ctrl+C Logic Verification
   console.log('\n--- Testing Double Ctrl+C Guard ---');
@@ -274,10 +399,10 @@ async function runTests() {
 
   console.log('\n--- Testing PTY Manager & Collaborative Agent State ---');
   assert(typeof ptyManager.isPtySupported() === 'boolean', 'ptyManager.isPtySupported() returns boolean');
-  assert(isAgentAvailable('agy') === true, 'isAgentAvailable(agy) accurately detects installed Antigravity');
+  assert(isAgentAvailable('cmdc') === true, 'isAgentAvailable(cmdc) accurately detects installed Command Code');
   assert(isAgentAvailable('codex') === true, 'isAgentAvailable(codex) accurately detects installed Codex');
   assert(ptyManager.getStatus('term') === 'idle', 'Initial term tab status is idle');
-  assert(ptyManager.getStatus('agy') === 'idle', 'Initial agy tab status is idle');
+  assert(ptyManager.getStatus('cmdc') === 'idle', 'Initial cmdc tab status is idle');
   assert(ptyManager.getStatus('codex') === 'idle', 'Initial codex tab status is idle');
 
   console.log('\n--- Testing Persistent Multi-Turn Agent Configuration & Usage ---');
@@ -305,7 +430,7 @@ async function runTests() {
 
   console.log('\n--- Testing Slash Commands & Autocomplete Matching ---');
   const commands = [
-    '/usage', '/model', '/effort', '/sandbox', '/new', '/resume', '/diff', '/kill', '/codex', '/agy', '/term', '/chat', '/files', '/web', '/help'
+    '/usage', '/model', '/effort', '/sandbox', '/new', '/resume', '/diff', '/kill', '/turf', '/cmdc', '/codex', '/agy', '/plan', '/term', '/chat', '/files', '/web', '/help'
   ];
   const filterByU = commands.filter(c => c.startsWith('/u'));
   assert(filterByU.includes('/usage'), 'Palette query "/u" matches /usage');
@@ -318,6 +443,15 @@ async function runTests() {
 
   const filterByD = commands.filter(c => c.startsWith('/d'));
   assert(filterByD.includes('/diff'), 'Palette query "/d" matches /diff');
+
+  const filterByTurf = commands.filter(c => c.startsWith('/tur'));
+  assert(filterByTurf.includes('/turf'), 'Palette query "/tur" matches /turf');
+
+  const filterByCmdc = commands.filter(c => c.startsWith('/cmd'));
+  assert(filterByCmdc.includes('/cmdc'), 'Palette query "/cmd" matches /cmdc');
+
+  const filterByP = commands.filter(c => c.startsWith('/p'));
+  assert(filterByP.includes('/plan'), 'Palette query "/p" matches /plan');
 
   console.log('\n--- Testing Structured Agent Message Events ---');
   let receivedMsg = null;
@@ -334,12 +468,12 @@ async function runTests() {
   assert(receivedMsg.text.includes('[Search]'), 'agent:msg contains structured tool badge');
 
   ptyManager.emit('agent:msg', {
-    tabId: 'agy',
+    tabId: 'cmdc',
     type: 'message',
-    text: '{bold}{149-fg}💬 Antigravity:{/149-fg}{/bold}\nPRD outline generated successfully.'
+    text: '{bold}{magenta-fg}💬 Command Code:{/magenta-fg}{/bold}\nPRD outline generated successfully.'
   });
-  assert(receivedMsg.tabId === 'agy', 'agent:msg has correct agy tabId');
-  assert(receivedMsg.text.includes('Antigravity'), 'agent:msg contains Antigravity prefix');
+  assert(receivedMsg.tabId === 'cmdc', 'agent:msg has correct cmdc tabId');
+  assert(receivedMsg.text.includes('Command Code'), 'agent:msg contains Command Code prefix');
 
   ptyManager.removeListener('agent:msg', msgHandler);
 
@@ -347,8 +481,8 @@ async function runTests() {
   // 1. Empty spawnSession returns null
   const emptyCodex = ptyManager.spawnSession('codex', '');
   assert(emptyCodex === null, 'spawnSession(codex, "") safely returns null without spawning process');
-  const emptyAgy = ptyManager.spawnSession('agy', '');
-  assert(emptyAgy === null, 'spawnSession(agy, "") safely returns null without spawning process');
+  const emptyCmdc = ptyManager.spawnSession('cmdc', '');
+  assert(emptyCmdc === null, 'spawnSession(cmdc, "") safely returns null without spawning process');
 
   // 2. safeEscape escapes curly braces
   const escaped = safeEscape('const x = { a: 1, b: 2 };');
@@ -363,37 +497,123 @@ async function runTests() {
   }), dummyCodexConfig, (ev, payload) => { parsedCodexMsg = payload; });
   assert(parsedCodexMsg !== null && parsedCodexMsg.text.includes('{open} return true; {close}'), 'parseCodexJsonLine escapes code curly braces');
 
-  // 4. parseAgyJsonLine handles response with curly braces safely
-  const agyMsgs = [];
-  const dummyAgyConfig = { turnCount: 1, totalTokens: 0 };
-  parseAgyJsonLine(JSON.stringify({
-    event: 'result',
-    result: { response: 'Code: { id: "123" }' }
-  }), dummyAgyConfig, (ev, payload) => { agyMsgs.push(payload); });
-  const agyMsgEvent = agyMsgs.find(m => m.type === 'message');
-  // 5. parseAgyJsonLine handles 429 rate limit with modern model tip
-  const agyErrMsgs = [];
-  parseAgyJsonLine(JSON.stringify({
-    event: 'result',
-    result: { error: 'RESOURCE_EXHAUSTED (code 429): Quota exceeded' }
-  }), dummyAgyConfig, (ev, payload) => { agyErrMsgs.push({ ev, payload }); });
-  const agyErr = agyErrMsgs.find(m => m.ev === 'agent:msg' && m.payload.type === 'error');
-  assert(agyErr !== undefined && agyErr.payload.text.includes('gemini-3.8-flash-high'), 'parseAgyJsonLine recommends modern gemini-3.8-flash-high model');
-  assert(!agyErr.payload.text.includes('gemini-2.5-flash'), 'parseAgyJsonLine does not recommend deprecated gemini-2.5-flash');
-  const agyIdleStatus = agyErrMsgs.find(m => m.ev === 'status' && m.payload.status === 'idle');
-  assert(agyIdleStatus !== undefined, 'parseAgyJsonLine immediately resets status to idle on 429 error');
+  // 4. parseCmdcJsonLine handles response, tool calls, and curly braces safely
+  const cmdcMsgs = [];
+  const dummyCmdcConfig = { turnCount: 1, totalTokens: 0 };
+  parseCmdcJsonLine(JSON.stringify({
+    type: 'message_end',
+    content: [{ type: 'text', text: 'Code: { id: "123" }' }]
+  }), dummyCmdcConfig, (ev, payload) => { cmdcMsgs.push(payload); });
+  const cmdcMsgEvent = cmdcMsgs.find(m => m.type === 'message');
+  assert(cmdcMsgEvent !== undefined && cmdcMsgEvent.text.includes('{open} id: "123" {close}'), 'parseCmdcJsonLine formats message and escapes curly braces');
 
-  // 6. parseAgyJsonLine live response streaming via agent:stream
-  const agyStreamMsgs = [];
-  parseAgyJsonLine(JSON.stringify({
-    event: 'step_update',
-    step_update: { step_type: 'agent_response', state: 'ACTIVE', text_delta: 'Hello streamed response!' }
-  }), dummyAgyConfig, (ev, payload) => { agyStreamMsgs.push({ ev, payload }); });
-  const streamEv = agyStreamMsgs.find(m => m.ev === 'agent:stream');
-  assert(streamEv !== undefined && streamEv.payload.text === 'Hello streamed response!', 'parseAgyJsonLine emits agent:stream for live response streaming');
-  assert(ptyManager.getModel('agy') === 'gemini-3.8-flash-high', 'ptyManager defaults agy model to gemini-3.8-flash-high');
+  // 5. parseCmdcJsonLine handles tool_call
+  const cmdcToolMsgs = [];
+  parseCmdcJsonLine(JSON.stringify({
+    type: 'tool_call',
+    tool: 'read',
+    path: 'server/tui.js'
+  }), dummyCmdcConfig, (ev, payload) => { cmdcToolMsgs.push(payload); });
+  const cmdcTool = cmdcToolMsgs.find(m => m.type === 'tool');
+  assert(cmdcTool !== undefined && cmdcTool.text.includes('[Read File]'), 'parseCmdcJsonLine renders tool badge');
 
-  // 7. Isolation Test: Codex error tips strictly suggest Codex models, never Gemini
+  // 6. parseCmdcJsonLine handles run_end and errors
+  const cmdcErrMsgs = [];
+  parseCmdcJsonLine(JSON.stringify({
+    type: 'run_end',
+    subtype: 'error',
+    error: 'Execution failed'
+  }), dummyCmdcConfig, (ev, payload) => { cmdcErrMsgs.push({ ev, payload }); });
+  const cmdcErr = cmdcErrMsgs.find(m => m.ev === 'agent:msg' && m.payload.type === 'error');
+  assert(cmdcErr !== undefined && cmdcErr.payload.text.includes('Execution failed'), 'parseCmdcJsonLine handles error run_end');
+  const cmdcIdleStatus = cmdcErrMsgs.find(m => m.ev === 'status' && m.payload.status === 'idle');
+  assert(cmdcIdleStatus !== undefined, 'parseCmdcJsonLine resets status to idle on error');
+
+  console.log('\n--- Testing Turf Agent Parser, Plan Mode & Intent-Lock Hook ---');
+  assert(typeof isAgentAvailable('turf') === 'boolean', 'isAgentAvailable(turf) returns boolean (false until fork binary installed)');
+
+  // Empty turf prompt: null when binary present, clean not-installed throw when absent
+  let turfEmpty = 'threw';
+  try { turfEmpty = ptyManager.spawnSession('turf', ''); } catch (e) { turfEmpty = e.message; }
+  assert(turfEmpty === null || String(turfEmpty).includes('not installed'), 'spawnSession(turf, "") returns null or clean not-installed error');
+
+  // Pi-schema lines: session header, tool badge, assistant message, done
+  const turfMsgs = [];
+  const turfCfg = { turnCount: 1, totalTokens: 0, sessionId: null };
+  const turfEmit = (ev, payload) => { turfMsgs.push({ ev, payload }); };
+  parseTurfJsonLine(JSON.stringify({ type: 'session', version: 3, id: 'turf-sess-1', cwd: '/repo' }), turfCfg, turfEmit);
+  assert(turfCfg.sessionId === 'turf-sess-1', 'parseTurfJsonLine captures Pi session id');
+  parseTurfJsonLine(JSON.stringify({ type: 'tool_execution_start', toolCallId: 't1', toolName: 'write', args: { path: 'src/a.js {x}' } }), turfCfg, turfEmit);
+  const turfTool = turfMsgs.find(m => m.payload && m.payload.type === 'tool');
+  assert(turfTool !== undefined && turfTool.payload.tabId === 'turf', 'parseTurfJsonLine emits turf tool badge');
+  assert(turfTool.payload.text.includes('[Edit File]') && turfTool.payload.text.includes('{open}x{close}'), 'parseTurfJsonLine badges write + escapes braces');
+  parseTurfJsonLine(JSON.stringify({ type: 'message_update', usage: { input: 10, output: 5 }, assistantMessageEvent: { type: 'text_delta', delta: 'hi' } }), turfCfg, turfEmit);
+  assert(turfCfg.totalTokens === 15, 'parseTurfJsonLine accumulates Pi usage');
+  parseTurfJsonLine(JSON.stringify({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: 'Done { ok }' }] } }), turfCfg, turfEmit);
+  const turfMsg = turfMsgs.find(m => m.payload && m.payload.type === 'message');
+  assert(turfMsg !== undefined && turfMsg.payload.text.includes('Turf:') && turfMsg.payload.text.includes('{open} ok {close}'), 'parseTurfJsonLine emits Turf assistant message, escaped');
+  parseTurfJsonLine(JSON.stringify({ type: 'agent_end', messages: [] }), turfCfg, turfEmit);
+  const turfDone = turfMsgs.find(m => m.payload && m.payload.type === 'done');
+  assert(turfDone !== undefined, 'parseTurfJsonLine emits done on agent_end');
+  parseTurfJsonLine('not json {{{', turfCfg, turfEmit);
+  const turfRaw = turfMsgs.find(m => m.payload && m.payload.type === 'raw');
+  assert(turfRaw !== undefined && turfRaw.payload.text.includes('{open}'), 'parseTurfJsonLine falls back to escaped raw');
+
+  // Plan mode defaults off, toggles, reflects in usage
+  assert(ptyManager.getPlanMode('turf') === false, 'Turf plan mode defaults off');
+  ptyManager.setPlanMode('turf', true);
+  assert(ptyManager.getPlanMode('turf') === true, 'ptyManager.setPlanMode enables plan mode');
+  assert(ptyManager.getUsageStats('turf').planMode === true, 'getUsageStats reflects plan mode');
+  ptyManager.setPlanMode('turf', false);
+
+  // turf-hook: granted -> conflict (exit 2) -> release -> granted
+  // ponytail: async execFile — execSync would block the parent loop and deadlock the in-process daemon
+  const hookRun = (agent, release = false) => new Promise((resolve) => {
+    const hookArgs = [path.join(TURF_ROOT, 'server', 'turf-hook.js'),
+      '--daemon', `http://127.0.0.1:${actualPort}`, '--room', 'TRF-TEST',
+      '--user', 'HookTest', '--file', 'hook/probe.js', '--agent', agent];
+    if (release) hookArgs.push('--release');
+    execFile(process.execPath, hookArgs, (err, stdout, stderr) => resolve({ err, stdout, stderr }));
+  });
+  let r = await hookRun('turfA');
+  assert(!r.err, 'turf-hook declares intent lock (exit 0)');
+  r = await hookRun('turfB');
+  assert(r.err && r.err.code === 2, 'turf-hook second agent gets conflict exit 2 (fork to worktree)');
+  r = await hookRun('turfA', true);
+  assert(!r.err, 'turf-hook releases lock (exit 0)');
+  r = await hookRun('turfB');
+  assert(!r.err, 'turf-hook release promotes queued agent');
+  await hookRun('turfB', true);
+
+  // 6. parseCmdcJsonLine live response streaming via agent:stream
+  const dummyCmdcStreamConfig = { turnCount: 1, totalTokens: 0, hasStreamedResponse: false };
+  const cmdcStreamMsgs = [];
+  parseCmdcJsonLine(JSON.stringify({
+    type: 'text_delta',
+    delta: 'Hello streamed response!'
+  }), dummyCmdcStreamConfig, (ev, payload) => { cmdcStreamMsgs.push({ ev, payload }); });
+  const streamEv = cmdcStreamMsgs.find(m => m.ev === 'agent:stream');
+  assert(streamEv !== undefined && streamEv.payload.text === 'Hello streamed response!', 'parseCmdcJsonLine emits agent:stream for live response streaming');
+  assert(ptyManager.getModel('cmdc') === 'default', 'ptyManager defaults cmdc model to default');
+
+  // Dynamic Model Discovery tests
+  const cmdcModels = getCmdcModels();
+  assert(Array.isArray(cmdcModels) && cmdcModels.length > 0, 'getCmdcModels returns models list');
+  assert(cmdcModels.some(m => m.id.includes('claude-sonnet') || m.id.includes('deepseek')), 'cmdc models includes verified models');
+
+  const turfModels = await getTurfModels();
+  assert(Array.isArray(turfModels) && turfModels.length > 0, 'getTurfModels returns models list');
+  assert(turfModels.some(m => m.id === 'openai/gpt-oss-120b'), 'turf models includes openai/gpt-oss-120b');
+
+  const codexModels = await getCodexModels();
+  assert(Array.isArray(codexModels) && codexModels.some(m => m.id === 'o3-mini'), 'codex models includes o3-mini');
+
+  const paletteTurf = await getPaletteModelsForTab('turf');
+  assert(paletteTurf.some(m => m.cmd.includes('openai/gpt-oss-120b')), 'getPaletteModelsForTab(turf) contains gpt-oss-120b');
+  const paletteCmdc = await getPaletteModelsForTab('cmdc');
+  assert(paletteCmdc.some(m => m.cmd.includes('/model')), 'getPaletteModelsForTab(cmdc) returns /model commands');
+
+  // 7. Isolation Test: Codex error tips strictly suggest Codex models
   const codexErrMsgs = [];
   parseCodexJsonLine(JSON.stringify({
     type: 'error',
@@ -401,7 +621,6 @@ async function runTests() {
   }), dummyCodexConfig, (ev, payload) => { codexErrMsgs.push({ ev, payload }); });
   const codexErr = codexErrMsgs.find(m => m.ev === 'agent:msg' && m.payload.type === 'error');
   assert(codexErr !== undefined && codexErr.payload.text.includes('o3-mini'), 'parseCodexJsonLine recommends o3-mini or gpt-4o on rate limit');
-  assert(!codexErr.payload.text.includes('gemini'), 'parseCodexJsonLine strictly never recommends Gemini models (isolated from AGY)');
 
   // 8. Rust tracing suppression: parseCodexJsonLine does not emit raw websocket traces
   let leakedTrace = false;
@@ -432,6 +651,177 @@ async function runTests() {
   assert(mockLogBox.scrollPerc === 95, 'mockLogBox.scroll(-5) scrolls backward through log history');
   mockLogBox.scroll(3);
   assert(mockLogBox.scrollPerc === 98, 'mockLogBox.scroll(3) scrolls forward through log history');
+
+  console.log('\n--- Testing Onboarding Multi-Key Re-Prompt, Gemini Studio Key & Textbox Fix ---');
+  // 1. Provider configuration check
+  const geminiProvider = TURF_PROVIDERS.find(p => p.env === 'GEMINI_API_KEY');
+  assert(!!geminiProvider, 'TURF_PROVIDERS includes GEMINI_API_KEY');
+  assert(geminiProvider && geminiProvider.label.includes('Gemini'), 'Gemini provider has clear friendly label');
+
+  // 2. hasAnyConfiguredKey check
+  const testTmpDir = path.join(os.tmpdir(), `turf-test-keys-${Date.now()}`);
+  fs.mkdirSync(testTmpDir, { recursive: true });
+  fs.writeFileSync(path.join(testTmpDir, '.env'), 'GEMINI_API_KEY=test-gemini-key-xyz\n');
+  assert(hasAnyConfiguredKey(testTmpDir) === true, 'hasAnyConfiguredKey detects key in workspace .env');
+
+  // 3. setupTurfApiKey skips when user responds 'n' to "add more keys?"
+  let askedQuestions = [];
+  const mockPromptNo = async (q) => {
+    askedQuestions.push(q);
+    return 'n'; // User declines adding more keys
+  };
+  const skipResult = await setupTurfApiKey(mockPromptNo, '', testTmpDir);
+  assert(skipResult === 'skipped', 'setupTurfApiKey returns skipped when user declines adding more keys');
+  assert(askedQuestions.some(q => q.includes('Do you want to add more keys')), 'setupTurfApiKey asks user if they want to add more keys');
+
+  // 4. setupTurfApiKey saves new key when user responds 'y'
+  const promptResponses = ['y', '1', 'gemini-new-studio-key', 'n'];
+  let rIdx = 0;
+  const mockPromptYes = async (q) => {
+    return promptResponses[rIdx++] || 'n';
+  };
+  const addResult = await setupTurfApiKey(mockPromptYes, '', testTmpDir);
+  assert(addResult === 'GEMINI_API_KEY', 'setupTurfApiKey successfully saved GEMINI_API_KEY');
+  const savedEnv = fs.readFileSync(path.join(testTmpDir, '.env'), 'utf8');
+  assert(savedEnv.includes('gemini-new-studio-key'), '.env contains the newly added Gemini key');
+  try { fs.rmSync(testTmpDir, { recursive: true, force: true }); } catch (e) {}
+
+  // 5. getTurfModels with GEMINI_API_KEY
+  const origGemini = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'test-gemini-key';
+  const turfModelsWithGemini = await getTurfModels(process.cwd());
+  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-flash'), 'getTurfModels includes gemini-2.5-flash when GEMINI_API_KEY exists');
+  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-pro'), 'getTurfModels includes gemini-2.5-pro when GEMINI_API_KEY exists');
+  if (origGemini) process.env.GEMINI_API_KEY = origGemini; else delete process.env.GEMINI_API_KEY;
+
+  // 6. Blessed textbox prototype listener crash guard
+  let listenerEmittedSubmit = false;
+  const mockTextbox = {
+    value: 'test command',
+    emit(event, val) {
+      if (event === 'submit') listenerEmittedSubmit = true;
+    }
+  };
+  // Calling _listener without _done function must NOT throw TypeError
+  let threwDoneError = false;
+  try {
+    blessed.textbox.prototype._listener.call(mockTextbox, '\r', { name: 'enter' });
+  } catch (err) {
+    threwDoneError = true;
+  }
+  assert(threwDoneError === false, 'blessed.textbox._listener does not throw when this._done is undefined');
+  assert(listenerEmittedSubmit === true, 'blessed.textbox._listener safely falls back to emit submit');
+
+  console.log('\n--- Testing Subsystem Fixes, IP Selection, Streaming & Agent Negotiation ---');
+  // 1. getLocalIp: must not return APIPA and must be valid IPv4
+  const resolvedIp = getLocalIp();
+  assert(typeof resolvedIp === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(resolvedIp), 'getLocalIp returns valid IPv4 address');
+  assert(!resolvedIp.startsWith('169.254.'), 'getLocalIp avoids link-local/APIPA address');
+
+  // 2. blessed.textarea prototype listener escape guard
+  let listenerEmittedCancel = false;
+  const mockTextarea = {
+    value: 'test content',
+    emit(event) {
+      if (event === 'cancel') listenerEmittedCancel = true;
+    }
+  };
+  let threwTextareaEscape = false;
+  try {
+    blessed.textarea.prototype._listener.call(mockTextarea, '', { name: 'escape' });
+  } catch (err) {
+    threwTextareaEscape = true;
+  }
+  assert(threwTextareaEscape === false, 'blessed.textarea._listener does not throw on escape when this._done is undefined');
+  assert(listenerEmittedCancel === true, 'blessed.textarea._listener safely falls back to emit cancel');
+
+  // 3. LockRegistry event emission and cross-platform worktreePath
+  let lockChanged = false;
+  const onLockChange = () => { lockChanged = true; };
+  lockRegistry.on('change', onLockChange);
+  const testLockRes = lockRegistry.requestLock('test/dummy-lock.js', 'agent-test-1', 'UserTest');
+  assert(lockChanged === true, 'lockRegistry emits change event on requestLock');
+  assert(testLockRes.status === 'granted', 'lockRegistry successfully grants lock');
+
+  // Conflict test: worktreePath must be in os.tmpdir()
+  const conflictRes = lockRegistry.requestLock('test/dummy-lock.js', 'agent-test-2', 'UserTest2', 1, 'TEST-ROOM');
+  assert(conflictRes.status === 'conflict', 'lockRegistry returns conflict for second agent');
+  assert(typeof conflictRes.worktreePath === 'string' && conflictRes.worktreePath.includes('TEST-ROOM'), 'lockRegistry returns cross-platform worktreePath with room code');
+
+  lockChanged = false;
+  lockRegistry.releaseLock('test/dummy-lock.js', 'agent-test-1');
+  assert(lockChanged === true, 'lockRegistry emits change event on releaseLock');
+  lockRegistry.off('change', onLockChange);
+
+  // 4. parseTurfJsonLine live token streaming & rate limit handling
+  const turfStreamMsgs = [];
+  const turfStreamCfg = { turnCount: 1, totalTokens: 0, sessionId: null };
+  parseTurfJsonLine(JSON.stringify({
+    type: 'message_update',
+    assistantMessageEvent: { type: 'text_delta', delta: 'Live streaming chunk' }
+  }), turfStreamCfg, (ev, payload) => { turfStreamMsgs.push({ ev, payload }); });
+  const streamMatch = turfStreamMsgs.find(m => m.ev === 'agent:stream' && m.payload.text === 'Live streaming chunk');
+  assert(streamMatch !== undefined, 'parseTurfJsonLine emits agent:stream for live word-by-word streaming');
+
+  const turfRateLimitMsgs = [];
+  const turfRateCfg = { turnCount: 1, totalTokens: 0, sessionId: null };
+  parseTurfJsonLine('Error 429: rate_limit_exceeded (tokens per minute)', turfRateCfg, (ev, payload) => { turfRateLimitMsgs.push({ ev, payload }); });
+  const rateLimitMsg = turfRateLimitMsgs.find(m => m.payload && m.payload.type === 'error');
+  assert(rateLimitMsg !== undefined && rateLimitMsg.payload.text.includes('Rate Limit (429)') && rateLimitMsg.payload.text.includes('Gemini Studio'), 'parseTurfJsonLine provides actionable advice on 429 rate limit');
+
+  // 5. POST /api/locks/negotiate
+  const negRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/negotiate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      fromAgent: 'turf',
+      fromUser: 'HostTester',
+      toAgent: 'cmdc',
+      file: 'src/demo.js',
+      message: 'Testing inter-agent negotiation handshake.'
+    })
+  });
+  assert(negRes.ok, '/api/locks/negotiate endpoint returns HTTP 200');
+  const negData = await negRes.json();
+  assert(negData.status === 'broadcasted', '/api/locks/negotiate successfully broadcasts message');
+
+  // 6. Lock Heartbeat and Instant Disconnect Eviction
+  lockRegistry.requestLock('test/heartbeat-lock.js', 'peer-agent-hb', 'PeerBob');
+  let beforeState = lockRegistry.getState().activeLocks.find(l => l.filePath.includes('heartbeat-lock.js'));
+  assert(beforeState !== undefined, 'Lock acquired for heartbeat test');
+  
+  const hbRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/heartbeat`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ user: 'PeerBob', agentId: 'peer-agent-hb' })
+  });
+  assert(hbRes.ok, 'POST /api/locks/heartbeat returns HTTP 200');
+  
+  // Instant Disconnect Eviction test: releaseAllForUser immediately frees all held locks
+  lockRegistry.releaseAllForUser('peer-agent-hb');
+  const afterState = lockRegistry.getState().activeLocks.find(l => l.filePath.includes('heartbeat-lock.js'));
+  assert(afterState === undefined, 'releaseAllForUser instantly frees locks on sudden client disconnect');
+
+  // 7. Live Continuous File Synchronization over WebSocket
+  let receivedFileSync = null;
+  const peerWs = new WebSocket(`ws://127.0.0.1:${actualPort}`);
+  await new Promise(r => peerWs.once('open', r));
+  const syncListener = (raw) => {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.type === 'file:sync') receivedFileSync = parsed;
+    } catch (e) {}
+  };
+  peerWs.on('message', syncListener);
+  ws.send(JSON.stringify({
+    type: 'file:sync',
+    origin: 'TestHost',
+    relPath: 'src/live-test.js',
+    content: 'export const live = true;'
+  }));
+  await new Promise(r => setTimeout(r, 200));
+  assert(receivedFileSync !== null && receivedFileSync.relPath === 'src/live-test.js' && receivedFileSync.content === 'export const live = true;', 'file:sync broadcasts live code replication to peer WebSocket');
+  peerWs.close();
 
   console.log('\n--- E2E Tests Complete ---');
   console.log(`Passed: ${passed}, Failed: ${failed}`);

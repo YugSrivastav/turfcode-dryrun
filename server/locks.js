@@ -1,15 +1,21 @@
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import { EventEmitter } from 'events';
 
-class LockRegistry {
+class LockRegistry extends EventEmitter {
   constructor() {
+    super();
     this.locks = new Map(); // filePath -> { agentId, user, expiresAt, lastActivity }
     this.queues = new Map(); // filePath -> array of requests
+    this.repoPath = process.cwd();
     
     // 10-Second Dead-Man Inactivity Sweeper
-    setInterval(() => this._evictZombies(), 1000);
+    const sweeper = setInterval(() => this._evictZombies(), 1000);
+    if (sweeper.unref) sweeper.unref();
   }
 
-  requestLock(filePath, agentId, user, priorityTier = 1) {
+  requestLock(filePath, agentId, user, priorityTier = 1, room = 'default') {
     const normalizedPath = path.normalize(filePath);
     
     // Evaluate Queue priorities
@@ -18,12 +24,14 @@ class LockRegistry {
       agentId,
       user,
       priorityTier,
+      room,
       enqueuedTime: now,
       score: this._getBaseScore(priorityTier)
     };
 
     if (!this.locks.has(normalizedPath)) {
       this._grantLock(normalizedPath, req);
+      this.emit('change', this.getState());
       return { status: "granted", filePath: normalizedPath };
     }
 
@@ -32,6 +40,7 @@ class LockRegistry {
     if (currentLock.agentId === agentId) {
       currentLock.expiresAt = now + 15000;
       currentLock.lastActivity = now;
+      this.emit('change', this.getState());
       return { status: "granted", filePath: normalizedPath };
     }
     
@@ -39,11 +48,17 @@ class LockRegistry {
       this.queues.set(normalizedPath, []);
     }
     this.queues.get(normalizedPath).push(req);
+    this.emit('change', this.getState());
     
+    const targetWorktree = path.join(os.tmpdir(), 'turf-worktrees', room || 'default', agentId).replace(/\\/g, '/');
+    try {
+      fs.mkdirSync(targetWorktree, { recursive: true });
+    } catch (e) {}
+
     return { 
       status: "conflict", 
       suggestedAction: "fork_speculative_worktree", 
-      worktreePath: `/tmp/turf-worktrees/default/${agentId}` 
+      worktreePath: targetWorktree 
     };
   }
 
@@ -54,6 +69,7 @@ class LockRegistry {
     if (lock && lock.agentId === agentId) {
       this.locks.delete(normalizedPath);
       this._promoteQueue(normalizedPath);
+      this.emit('change', this.getState());
       return { status: "released", filePath: normalizedPath };
     }
     return { status: "ignored" };
@@ -66,6 +82,7 @@ class LockRegistry {
        const now = Date.now();
        lock.expiresAt = now + 15000;
        lock.lastActivity = now;
+       this.emit('change', this.getState());
      }
   }
 
@@ -94,17 +111,22 @@ class LockRegistry {
     
     const nextReq = queue.shift();
     this._grantLock(filePath, nextReq);
+    this.emit('change', this.getState());
   }
 
   _evictZombies() {
     const now = Date.now();
+    let changed = false;
     for (const [filePath, lock] of this.locks.entries()) {
       // 10-Second Dead-Man Inactivity Sweeper
       if (now - lock.lastActivity > 10000 || now > lock.expiresAt) {
         this.locks.delete(filePath);
         this._promoteQueue(filePath);
-        // We'd emit a lock:evicted event here if we had access to the emitter
+        changed = true;
       }
+    }
+    if (changed) {
+      this.emit('change', this.getState());
     }
   }
 
@@ -118,6 +140,45 @@ class LockRegistry {
     }
   }
   
+  heartbeat(userOrAgentId) {
+    if (!userOrAgentId) return;
+    const now = Date.now();
+    let touched = false;
+    for (const [filePath, lock] of this.locks.entries()) {
+      if (lock.agentId === userOrAgentId || lock.user === userOrAgentId) {
+        lock.expiresAt = now + 15000;
+        lock.lastActivity = now;
+        touched = true;
+      }
+    }
+    if (touched) {
+      this.emit('change', this.getState());
+    }
+  }
+
+  releaseAllForUser(userOrAgentId) {
+    if (!userOrAgentId) return;
+    let released = false;
+    for (const [filePath, lock] of this.locks.entries()) {
+      if (lock.agentId === userOrAgentId || lock.user === userOrAgentId) {
+        this.locks.delete(filePath);
+        this._promoteQueue(filePath);
+        released = true;
+      }
+    }
+    // Also remove from all queues
+    for (const [filePath, queue] of this.queues.entries()) {
+      const filtered = queue.filter(q => q.agentId !== userOrAgentId && q.user !== userOrAgentId);
+      if (filtered.length !== queue.length) {
+        this.queues.set(filePath, filtered);
+        released = true;
+      }
+    }
+    if (released) {
+      this.emit('change', this.getState());
+    }
+  }
+
   orderPaths(paths) {
     return [...paths].map(p => path.normalize(p)).sort();
   }
