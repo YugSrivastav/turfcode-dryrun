@@ -156,13 +156,181 @@ export function getTruncatedPath(dirPath, maxLen = 22) {
   return dirPath.slice(0, maxLen - base.length - 4) + '…/' + base;
 }
 
+export function calculateLayout(cols = 100, rows = 30, leftCollapsed = false, rightCollapsed = false) {
+  const minCenterW = 38;
+  const headerHeight = 1;
+  const footerHeight = 1;
+  const contentHeight = Math.max(8, rows - headerHeight - footerHeight);
+
+  let leftW = 0;
+  let rightW = 0;
+
+  if (cols < 75) {
+    leftW = 0;
+    rightW = 0;
+  } else if (cols < 95) {
+    leftW = leftCollapsed ? 0 : 20;
+    rightW = rightCollapsed ? 0 : 24;
+    if (cols - leftW - rightW < minCenterW) {
+      leftW = 0;
+      if (cols - rightW < minCenterW) {
+        rightW = Math.max(0, cols - minCenterW);
+      }
+    }
+  } else if (cols < 125) {
+    leftW = leftCollapsed ? 0 : 24;
+    rightW = rightCollapsed ? 0 : 28;
+    if (cols - leftW - rightW < minCenterW) {
+      leftW = leftCollapsed ? 0 : Math.max(0, Math.floor(cols * 0.22));
+      rightW = rightCollapsed ? 0 : Math.max(0, Math.floor(cols * 0.26));
+    }
+  } else {
+    leftW = leftCollapsed ? 0 : 28;
+    rightW = rightCollapsed ? 0 : 32;
+  }
+
+  if (rightCollapsed) rightW = 0;
+  if (leftCollapsed) leftW = 0;
+
+  const centerW = Math.max(minCenterW, cols - leftW - rightW);
+
+  return {
+    cols,
+    rows,
+    header: { top: 0, left: 0, width: cols, height: 1 },
+    footer: { top: rows - 1, bottom: 0, left: 0, width: cols, height: 1 },
+    leftSidebar: { top: 1, left: 0, width: leftW, height: contentHeight, hidden: leftW === 0 },
+    centerPane: { top: 1, left: leftW, width: centerW, height: contentHeight },
+    rightSidebar: { top: 1, left: leftW + centerW, width: rightW, height: contentHeight, hidden: rightW === 0 },
+    contentHeight
+  };
+}
+
+export function buildHeaderContent(cols = 100, options = {}) {
+  const {
+    roomCode = 'TRF-0000',
+    localIp = '127.0.0.1',
+    hostAddress = '127.0.0.1',
+    port = 7777,
+    hostName = 'User',
+    currentDir = ''
+  } = options;
+
+  const brand = '{bold}{149-fg}TURF{/149-fg}{white-fg}CODE{/white-fg}{/bold}';
+  const ipStr = `${localIp || hostAddress || '127.0.0.1'}:${port}`;
+
+  if (cols < 65) {
+    return ` ${brand} │ {yellow-fg}${roomCode}{/yellow-fg} │ {cyan-fg}${hostName}{/cyan-fg}`;
+  }
+
+  if (cols < 90) {
+    const maxPath = Math.max(6, cols - 48);
+    const truncPath = getTruncatedPath(currentDir, maxPath);
+    return ` ${brand} │ {yellow-fg}${roomCode}{/yellow-fg} │ {cyan-fg}${hostName}{/cyan-fg} │ {yellow-fg}${truncPath}{/yellow-fg}`;
+  }
+
+  if (cols < 120) {
+    const maxPath = Math.max(8, cols - 68);
+    const truncPath = getTruncatedPath(currentDir, maxPath);
+    return ` ${brand} │ Room: {bold}{yellow-fg}${roomCode}{/yellow-fg}{/bold} │ WiFi: {yellow-fg}${ipStr}{/yellow-fg} │ User: {bold}{cyan-fg}${hostName}{/cyan-fg}{/bold} │ Dir: {yellow-fg}${truncPath}{/yellow-fg}`;
+  }
+
+  const maxPath = Math.max(14, cols - 75);
+  const truncPath = getTruncatedPath(currentDir, maxPath);
+  return ` ${brand} │ Room: {bold}{yellow-fg}${roomCode}{/yellow-fg}{/bold} │ WiFi: {bold}{yellow-fg}${ipStr}{/yellow-fg}{/bold} │ User: {bold}{cyan-fg}${hostName}{/cyan-fg}{/bold} │ Dir: {yellow-fg}${truncPath}{/yellow-fg}`;
+}
+
+export function buildFooterContent(cols = 100, customPills = null) {
+  const defaultPills = [
+    { text: '{bold}{149-fg}[Tab]{/149-fg}{/bold} Focus', plain: '[Tab] Focus' },
+    { text: '{bold}{149-fg}[/]{/149-fg}{/bold} Cmds', plain: '[/] Cmds' },
+    { text: '{bold}{green-fg}[/turf]{/green-fg}{/bold} Turf', plain: '[/turf] Turf' },
+    { text: '{bold}{magenta-fg}[/cmdc]{/magenta-fg}{/bold} CMDC', plain: '[/cmdc] CMDC' },
+    { text: '{bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex', plain: '[/codex] Codex' },
+    { text: '{bold}{yellow-fg}[F4]{/yellow-fg}{/bold} File', plain: '[F4] File' },
+    { text: '{bold}{yellow-fg}[F2]{/yellow-fg}{/bold} Intent', plain: '[F2] Intent' },
+    { text: '{bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files', plain: '[F3] Files' },
+    { text: '{bold}{yellow-fg}[Ctrl+B]{/yellow-fg}{/bold} Left', plain: '[Ctrl+B] Left' },
+    { text: '{bold}{yellow-fg}[Ctrl+E]{/yellow-fg}{/bold} Right', plain: '[Ctrl+E] Right' },
+    { text: '{bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web', plain: '[Ctrl+O] Web' },
+    { text: '{bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll', plain: '[PgUp/Dn] Scroll' },
+    { text: '{bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo', plain: '[F5] Demo' },
+    { text: '{bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit', plain: '[Ctrl+C] Quit' }
+  ];
+
+  const pills = customPills || defaultPills;
+  let res = ' ';
+  let plainLen = 1;
+  const maxLen = Math.max(12, cols - 2);
+
+  for (let i = 0; i < pills.length; i++) {
+    const pill = pills[i];
+    const sep = i === 0 ? '' : ' │ ';
+    const sepPlainLen = i === 0 ? 0 : 3;
+    if (plainLen + sepPlainLen + pill.plain.length > maxLen) {
+      break;
+    }
+    res += sep + pill.text;
+    plainLen += sepPlainLen + pill.plain.length;
+  }
+  return res + ' ';
+}
+
+export function buildCenterLabel(centerW = 60, activeCenterTab = 'turf', statuses = {}, openedFile = null, isPlanMode = false) {
+  const termStatus = statuses.termStatus || 'idle';
+  const cmdcStatus = statuses.cmdcStatus || 'idle';
+  const codexStatus = statuses.codexStatus || 'idle';
+  const turfStatus = statuses.turfStatus || 'idle';
+
+  const fileBase = openedFile ? path.basename(openedFile) : null;
+
+  function tabBadge(name, st) {
+    if (st === 'working') return `${name}*`;
+    if (st === 'awaiting_input') return `${name}?`;
+    return name;
+  }
+
+  if (centerW < 46) {
+    let activeName = activeCenterTab.toUpperCase();
+    if (activeCenterTab === 'turf' && isPlanMode) activeName += ' (PLAN)';
+    const st = statuses[activeCenterTab + 'Status'];
+    if (st === 'working') activeName += '*';
+    if (activeCenterTab === 'file' && fileBase) {
+      activeName = `FILE: ${truncateString(fileBase, 10)}`;
+    }
+    return ` [● ${activeName}] `;
+  }
+
+  if (centerW < 68) {
+    const t = turfStatus === 'working' ? 'TURF*' : 'TURF';
+    const c = cmdcStatus === 'working' ? 'CMDC*' : 'CMDC';
+    const x = codexStatus === 'working' ? 'CDX*' : 'CDX';
+    const s = termStatus === 'working' ? 'TERM*' : 'TERM';
+    const f = fileBase ? truncateString(fileBase, 8) : 'FILE';
+
+    const pill = (tab, label) => (activeCenterTab === tab || (tab === 'cmdc' && activeCenterTab === 'agy')) ? `[● ${label}]` : `○ ${label}`;
+    return ` ${pill('turf', t)} │ ${pill('cmdc', c)} │ ${pill('codex', x)} │ ${pill('term', s)} │ ${activeCenterTab === 'file' ? `[● ${f}]` : f} `;
+  }
+
+  const termLabel = tabBadge('TERM', termStatus);
+  const cmdcLabel = tabBadge('CMDC', cmdcStatus);
+  const codexLabel = tabBadge('CODEX', codexStatus);
+  const turfBase = tabBadge('TURF', turfStatus);
+  const turfLabel = isPlanMode ? `${turfBase} (PLAN)` : turfBase;
+  const truncatedBase = fileBase ? truncateString(fileBase, 12) : null;
+  const fileLabel = truncatedBase ? `FILE: ${truncatedBase} (F4)` : 'FILE (F4)';
+
+  const pill = (tab, label) => (activeCenterTab === tab || (tab === 'cmdc' && activeCenterTab === 'agy')) ? `[● ${label}]` : `○ ${label}`;
+  return ` ${pill('turf', turfLabel)} │ ${pill('cmdc', cmdcLabel)} │ ${pill('codex', codexLabel)} │ ${pill('term', termLabel)} │ ${activeCenterTab === 'file' ? `[● ${fileLabel}]` : fileLabel} `;
+}
+
 export function formatTreeNode(node, maxInnerWidth = 24) {
   const indentWidth = node.depth * 2;
   const indent = '  '.repeat(node.depth);
 
   if (node.isDir) {
     const arrow = node.isExpanded ? '▾' : '▸';
-    const maxNameLen = Math.max(4, maxInnerWidth - indentWidth - 4);
+    const maxNameLen = Math.max(3, maxInnerWidth - indentWidth - 5);
     const displayName = truncateString(node.name, maxNameLen);
     const raw = `${indent} {bold}{yellow-fg}${arrow} ${displayName}/{/yellow-fg}{/bold}`;
     return padToWidth(raw, maxInnerWidth);
@@ -185,7 +353,7 @@ export function formatTreeNode(node, maxInnerWidth = 24) {
     color = 'yellow-fg';
   }
 
-  const maxNameLen = Math.max(4, maxInnerWidth - indentWidth - 5);
+  const maxNameLen = Math.max(3, maxInnerWidth - indentWidth - 6);
   const displayName = truncateString(node.name, maxNameLen);
   const raw = `${indent}   {${color}}▪ ${displayName}{/${color}}`;
   return padToWidth(raw, maxInnerWidth);
@@ -231,11 +399,12 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   process.stdout.write('\x1b[?1049h\x1b[2J\x1b[3J\x1b[H');
 
   const screen = blessed.screen({
-    smartCSR: false,
-    fastCSR: false,
-    useBCE: false,
+    smartCSR: true,
+    fastCSR: true,
+    useBCE: true,
     title: 'Turfcode',
-    dockBorders: false,
+    dockBorders: true,
+    autoPadding: true,
     fullUnicode: true,
     warnings: false,
     mouse: true,
@@ -323,17 +492,29 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   screen.append(header);
 
   function updateHeader() {
-    const availableWidth = screen.width || 100;
-    const maxPath = Math.max(15, availableWidth - 75);
-    header.setContent(` {bold}{149-fg}TURF{/149-fg}{white-fg}CODE{/white-fg}{/bold} │ Room: {bold}{yellow-fg}${roomCode}{/yellow-fg}{/bold} │ WiFi: {bold}{yellow-fg}${localIp || hostAddress}:${port}{/yellow-fg}{/bold} │ User: {bold}{cyan-fg}${hostName}{/cyan-fg}{/bold} │ Dir: {yellow-fg}${getTruncatedPath(currentDir, maxPath)}{/yellow-fg}`);
+    const cols = screen.width || 100;
+    header.setContent(buildHeaderContent(cols, {
+      roomCode,
+      localIp,
+      hostAddress,
+      port,
+      hostName,
+      currentDir
+    }));
   }
   updateHeader();
 
+  let isLeftSidebarCollapsed = (screen.width || 100) < 95;
+  let isRightSidebarCollapsed = false;
+
+  const initLayout = calculateLayout(screen.width || 100, screen.height || 30, isLeftSidebarCollapsed, isRightSidebarCollapsed);
+
   const leftSidebar = blessed.box({
     top: 1,
-    left: 0,
-    width: 32,
-    height: '100%-2',
+    left: initLayout.leftSidebar.left,
+    width: initLayout.leftSidebar.width,
+    height: initLayout.leftSidebar.height,
+    hidden: initLayout.leftSidebar.hidden
   });
   screen.append(leftSidebar);
 
@@ -403,9 +584,9 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
   const centerPane = blessed.box({
     top: 1,
-    left: 32,
-    width: '100%-64',
-    height: '100%-2',
+    left: initLayout.centerPane.left,
+    width: initLayout.centerPane.width,
+    height: initLayout.centerPane.height,
     label: ' [TERMINAL]  FILE (F4) ',
     border: { type: 'line', fg: 'green' },
     style: {
@@ -415,33 +596,72 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
   screen.append(centerPane);
 
-  let isSidebarCollapsed = false;
-  function toggleSidebar() {
-    isSidebarCollapsed = !isSidebarCollapsed;
-    if (isSidebarCollapsed) {
+  const rightSidebar = blessed.box({
+    top: 1,
+    left: initLayout.rightSidebar.left,
+    width: initLayout.rightSidebar.width,
+    height: initLayout.rightSidebar.height,
+    hidden: initLayout.rightSidebar.hidden
+  });
+  screen.append(rightSidebar);
+
+  function applyLayout() {
+    const cols = screen.width || 100;
+    const rows = screen.height || 30;
+    const layout = calculateLayout(cols, rows, isLeftSidebarCollapsed, isRightSidebarCollapsed);
+
+    if (layout.leftSidebar.hidden) {
       leftSidebar.hide();
-      centerPane.left = 0;
-      centerPane.width = '100%-32';
     } else {
       leftSidebar.show();
-      centerPane.left = 32;
-      centerPane.width = '100%-64';
+      leftSidebar.left = layout.leftSidebar.left;
+      leftSidebar.width = layout.leftSidebar.width;
+      leftSidebar.height = layout.leftSidebar.height;
     }
+
+    if (rightSidebar) {
+      if (layout.rightSidebar.hidden) {
+        rightSidebar.hide();
+      } else {
+        rightSidebar.show();
+        rightSidebar.left = layout.rightSidebar.left;
+        rightSidebar.width = layout.rightSidebar.width;
+        rightSidebar.height = layout.rightSidebar.height;
+      }
+    }
+
+    centerPane.left = layout.centerPane.left;
+    centerPane.width = layout.centerPane.width;
+    centerPane.height = layout.centerPane.height;
+
+    updateHeader();
+    if (typeof resetFooter === 'function') resetFooter();
+    if (typeof updateCenterLabel === 'function') updateCenterLabel();
+
+    const fileInnerW = Math.max(12, (layout.leftSidebar.width || 28) - 3);
+    if (typeof visibleFileList !== 'undefined' && visibleFileList && visibleFileList.length > 0) {
+      const formattedItems = visibleFileList.map(node => formatTreeNode(node, fileInnerW));
+      filesList.setItems(formattedItems);
+    }
+
     screen.realloc();
     screen.render();
   }
 
+  function toggleLeftSidebar() {
+    isLeftSidebarCollapsed = !isLeftSidebarCollapsed;
+    applyLayout();
+  }
+
+  function toggleRightSidebar() {
+    isRightSidebarCollapsed = !isRightSidebarCollapsed;
+    applyLayout();
+  }
+
+  const toggleSidebar = toggleLeftSidebar;
+
   screen.on('resize', () => {
-    updateHeader();
-    if (isSidebarCollapsed) {
-      centerPane.left = 0;
-      centerPane.width = '100%-32';
-    } else {
-      centerPane.left = 32;
-      centerPane.width = '100%-64';
-    }
-    screen.realloc();
-    screen.render();
+    applyLayout();
   });
 
   const termLog = blessed.box({
@@ -597,37 +817,29 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     const codexStatus = ptyManager.getStatus('codex');
     const turfStatus = ptyManager.getStatus('turf');
 
-    const termLabel = termStatus === 'working' ? 'TERM*' : 'TERM';
-    const cmdcLabel = formatTabBadge('CMDC', cmdcStatus);
-    const codexLabel = formatTabBadge('CODEX', codexStatus);
-    const turfBase = formatTabBadge('TURF', turfStatus);
-    const turfLabel = ptyManager.getPlanMode('turf') ? `${turfBase} (PLAN)` : turfBase;
-    
-    const fileBase = currentOpenedFile ? path.basename(currentOpenedFile) : null;
-    const truncatedBase = fileBase ? truncateString(fileBase, 12) : null;
-    const fileLabel = truncatedBase ? `FILE: ${truncatedBase} (F4)` : 'FILE (F4)';
-    
+    const statuses = { termStatus, cmdcStatus, codexStatus, turfStatus };
+    const centerW = (centerPane && centerPane.width) ? centerPane.width : 60;
+    const isPlan = ptyManager.getPlanMode('turf');
+
+    const labelText = buildCenterLabel(centerW, activeCenterTab, statuses, currentOpenedFile, isPlan);
+
     if (activeCenterTab === 'file') {
       centerPane.style.border.fg = 'yellow';
       if (centerPane.style.label) centerPane.style.label.fg = 'yellow';
-      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ ○ ${termLabel} │ [● ${fileLabel}] `);
     } else if (activeCenterTab === 'turf') {
       centerPane.style.border.fg = 'green';
       if (centerPane.style.label) centerPane.style.label.fg = 'green';
-      centerPane.setLabel(` [● ${turfLabel}] │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ ○ ${termLabel} │ ${fileLabel} `);
     } else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') {
       centerPane.style.border.fg = 'magenta';
       if (centerPane.style.label) centerPane.style.label.fg = 'magenta';
-      centerPane.setLabel(` ○ ${turfLabel} │ [● ${cmdcLabel}] │ ○ ${codexLabel} │ ○ ${termLabel} │ ${fileLabel} `);
     } else if (activeCenterTab === 'codex') {
       centerPane.style.border.fg = 'cyan';
       if (centerPane.style.label) centerPane.style.label.fg = 'cyan';
-      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ [● ${codexLabel}] │ ○ ${termLabel} │ ${fileLabel} `);
     } else {
       centerPane.style.border.fg = 'green';
       if (centerPane.style.label) centerPane.style.label.fg = 'green';
-      centerPane.setLabel(` ○ ${turfLabel} │ ○ ${cmdcLabel} │ ○ ${codexLabel} │ [● ${termLabel}] │ ${fileLabel} `);
     }
+    centerPane.setLabel(labelText);
   }
 
   let cachedPaletteModels = [];
@@ -776,7 +988,8 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   let expandedDirs = new Set();
   let isTreeInitialized = false;
 
-  function refreshFileList(preserveSelection = true) {
+  function refreshFileList(preserveSelection = true, maxInnerW) {
+    const innerW = maxInnerW || Math.max(12, ((leftSidebar && leftSidebar.width) || 28) - 3);
     const prevSelectedRel = (visibleFileList && visibleFileList[filesList.selected]) 
       ? visibleFileList[filesList.selected].relPath 
       : null;
@@ -799,7 +1012,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     if (visibleFileList.length === 0) {
       filesList.setItems([' {grey-fg}(no files found){/grey-fg}']);
     } else {
-      const formattedItems = visibleFileList.map(node => formatTreeNode(node));
+      const formattedItems = visibleFileList.map(node => formatTreeNode(node, innerW));
       filesList.setItems(formattedItems);
 
       if (preserveSelection && prevSelectedRel) {
@@ -925,6 +1138,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     { cmd: '/term', desc: 'Switch to Shell terminal or run command (/term <command>)' },
     { cmd: '/chat', desc: 'Send message to team chat or focus chat (/chat <msg>)' },
     { cmd: '/files', desc: 'Focus workspace file explorer [F3]' },
+    { cmd: '/sidebar', desc: 'Toggle left or right sidebar (/sidebar left | right)' },
     { cmd: '/web', desc: 'Open collaborative web preview browser [Ctrl+O]' },
     { cmd: '/help', desc: 'Show full command documentation and shortcuts' }
   ];
@@ -1063,13 +1277,6 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     });
   });
 
-  const rightSidebar = blessed.box({
-    top: 1,
-    right: 0,
-    width: 32,
-    height: '100%-2',
-  });
-  screen.append(rightSidebar);
 
   const intentBox = blessed.box({
     parent: rightSidebar,
@@ -1335,7 +1542,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     width: '100%',
     height: 1,
     tags: true,
-    content: ` {bold}{149-fg}[Tab]{/149-fg}{/bold} Switch Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{green-fg}[/turf]{/green-fg}{/bold} Turf │ {bold}{magenta-fg}[/cmdc]{/magenta-fg}{/bold} CMDC │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[F4]{/yellow-fg}{/bold} Term/File │ {bold}{yellow-fg}[F2]{/yellow-fg}{/bold} Intent │ {bold}{yellow-fg}[Ctrl+B]{/yellow-fg}{/bold} Sidebar │ {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `,
+    content: buildFooterContent(screen.width || 100),
     style: {
       fg: 'white',
       bg: 'black'
@@ -1548,20 +1755,32 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   function updateFocusStyles() {
     updateCenterLabel();
 
+    if (centerPane && centerPane.style && centerPane.style.border) {
+      if (focusIndex === 0) {
+        if (activeCenterTab === 'file') centerPane.style.border.fg = 'yellow';
+        else if (activeCenterTab === 'turf') centerPane.style.border.fg = 'green';
+        else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') centerPane.style.border.fg = 'magenta';
+        else if (activeCenterTab === 'codex') centerPane.style.border.fg = 'cyan';
+        else centerPane.style.border.fg = 'green';
+      } else {
+        centerPane.style.border.fg = 'grey';
+      }
+    }
+
     if (filesBox && filesBox.style && filesBox.style.border) {
-      filesBox.style.border.fg = focusIndex === 2 ? 'green' : 'cyan';
-      filesBox.setLabel(' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ');
+      filesBox.style.border.fg = focusIndex === 2 ? 'green' : 'grey';
+      filesBox.setLabel(focusIndex === 2 ? ' {bold}{green-fg}[FILES]{/green-fg}{/bold} {grey-fg}[F3]{/grey-fg} ' : ' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ');
     }
 
     if (chatLogBox && chatLogBox.style && chatLogBox.style.border) {
-      chatLogBox.style.border.fg = focusIndex === 1 ? 'green' : 'blue';
+      chatLogBox.style.border.fg = focusIndex === 1 ? 'green' : 'grey';
     }
     if (chatInputBox && chatInputBox.style && chatInputBox.style.border) {
-      chatInputBox.style.border.fg = focusIndex === 1 ? 'green' : 'cyan';
-      chatInputBox.setLabel(' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ');
+      chatInputBox.style.border.fg = focusIndex === 1 ? 'green' : 'grey';
+      chatInputBox.setLabel(focusIndex === 1 ? ' {bold}{green-fg}[CHAT INPUT]{/green-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ' : ' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ');
     }
     if (chatInputPrompt) {
-      chatInputPrompt.setContent(focusIndex === 1 ? '{149-fg}💬 >{/149-fg} ' : '{cyan-fg}💬 >{/cyan-fg} ');
+      chatInputPrompt.setContent(focusIndex === 1 ? '{green-fg}💬 >{/green-fg} ' : '{cyan-fg}💬 >{/cyan-fg} ');
     }
 
     screen.render();
@@ -1614,7 +1833,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   }
 
   function resetFooter() {
-    footer.setContent(` {bold}{149-fg}[Tab]{/149-fg}{/bold} Focus │ {bold}{149-fg}[Ctrl+T]{/149-fg}{/bold} Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{149-fg}[/]{/149-fg}{/bold} Cmds │ {bold}{green-fg}[/turf]{/green-fg}{/bold} Turf │ {bold}{magenta-fg}[/cmdc]{/magenta-fg}{/bold} CMDC │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[/usage]{/yellow-fg}{/bold} Stats │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `);
+    footer.setContent(buildFooterContent(screen.width || 100));
   }
 
   function cleanActiveInput() {
@@ -1837,7 +2056,14 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
     // 2. Ctrl+B: Toggle Left Sidebar
     if ((key.ctrl && (key.name === 'b' || key.name === 'B')) || ch === '\x02') {
-      toggleSidebar();
+      toggleLeftSidebar();
+      cleanActiveInput();
+      return;
+    }
+
+    // 2b. Ctrl+E: Toggle Right Sidebar
+    if ((key.ctrl && (key.name === 'e' || key.name === 'E')) || ch === '\x05') {
+      toggleRightSidebar();
       cleanActiveInput();
       return;
     }
@@ -1959,7 +2185,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       const isPageUp = key.name === 'pageup' || ch === '\x1b[5~';
       const isPageDown = key.name === 'pagedown' || ch === '\x1b[6~';
       const isUpScroll = (key.shift && key.name === 'up') || (key.ctrl && key.name === 'up') || (key.ctrl && (key.name === 'y' || ch === '\x19')) || (focusIndex === 0 && key.name === 'up' && !(terminalInput.value || '').trim());
-      const isDownScroll = (key.shift && key.name === 'down') || (key.ctrl && key.name === 'down') || (key.ctrl && (key.name === 'e' || ch === '\x05')) || (focusIndex === 0 && key.name === 'down' && !(terminalInput.value || '').trim());
+      const isDownScroll = (key.shift && key.name === 'down') || (key.ctrl && key.name === 'down') || (key.ctrl && (key.name === 'd' || ch === '\x04')) || (focusIndex === 0 && key.name === 'down' && !(terminalInput.value || '').trim());
       const isHome = (key.shift && key.name === 'home');
       const isEnd = (key.shift && key.name === 'end');
 
@@ -2253,8 +2479,23 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/turf, /cmdc, /codex, /term{/bold} Switch tab or run targeted command`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/plan{/bold}                Toggle read-only recon plan mode`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/chat <msg>{/bold}          Send team chat message or focus chat`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sidebar <left|right>{/bold} Toggle left or right sidebar (or Ctrl+B / Ctrl+E)`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
       currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/sidebar' || inputStr.startsWith('/sidebar ')) {
+      const arg = inputStr.replace(/^\/sidebar\s*/, '').trim().toLowerCase();
+      if (arg === 'right') {
+        toggleRightSidebar();
+        currentLog.log(`{green-fg}✔ Toggled right sidebar (${isRightSidebarCollapsed ? 'hidden' : 'visible'}){/green-fg}`);
+      } else {
+        toggleLeftSidebar();
+        currentLog.log(`{green-fg}✔ Toggled left sidebar (${isLeftSidebarCollapsed ? 'hidden' : 'visible'}){/green-fg}`);
+      }
       terminalInput.clearValue();
       focusTerminal();
       return;

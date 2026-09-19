@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import blessed from 'blessed';
 import { spawnHostDaemon, getLocalIp } from '../server/index.js';
 import { lockRegistry } from '../server/locks.js';
-import { buildFileTree, flattenFileTree, formatTreeNode, getProjectFiles, getTruncatedPath } from '../server/tui.js';
+import { buildFileTree, flattenFileTree, formatTreeNode, getProjectFiles, getTruncatedPath, calculateLayout, buildHeaderContent, buildFooterContent, buildCenterLabel } from '../server/tui.js';
 import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
 import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from '../server/pty_manager.js';
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
@@ -822,6 +822,92 @@ async function runTests() {
   await new Promise(r => setTimeout(r, 200));
   assert(receivedFileSync !== null && receivedFileSync.relPath === 'src/live-test.js' && receivedFileSync.content === 'export const live = true;', 'file:sync broadcasts live code replication to peer WebSocket');
   peerWs.close();
+
+  // 8. Herdr-Style Adaptive Layout & Responsive Widget Tests
+  console.log('\n--- Testing P8: Adaptive Responsive TUI Layout Engine ---');
+  
+  // Mobile / ultra-compact layout (60x20)
+  const mobileLayout = calculateLayout(60, 20);
+  assert(mobileLayout.leftSidebar.hidden === true, 'Ultra-compact terminal (<75 cols) auto-collapses left sidebar');
+  assert(mobileLayout.rightSidebar.hidden === true, 'Ultra-compact terminal (<75 cols) auto-collapses right sidebar');
+  assert(mobileLayout.centerPane.width >= 38, 'Ultra-compact terminal guarantees at least 38 columns for center pane');
+  assert(mobileLayout.centerPane.left === 0, 'Center pane occupies full terminal left on ultra-compact');
+
+  // Classic 80x24 terminal
+  const classicLayout = calculateLayout(80, 24);
+  assert(classicLayout.centerPane.width >= 38, 'Classic 80-col terminal guarantees at least 38 columns for center coding pane');
+  assert(classicLayout.leftSidebar.width + classicLayout.centerPane.width + classicLayout.rightSidebar.width <= 80, 'Total panels width does not exceed terminal columns on 80x24');
+
+  // Small 100x30 laptop
+  const laptop100Layout = calculateLayout(100, 30);
+  assert(laptop100Layout.leftSidebar.width === 24, '100-col laptop provides 24-col left sidebar');
+  assert(laptop100Layout.rightSidebar.width === 28, '100-col laptop provides 28-col right sidebar');
+  assert(laptop100Layout.centerPane.width === 48, '100-col laptop provides 48-col center pane');
+
+  // Standard 120x35 laptop
+  const laptop120Layout = calculateLayout(120, 35);
+  assert(laptop120Layout.centerPane.width === 68, '120-col laptop provides 68-col wide center pane');
+
+  // Wide 160x45 desktop monitor
+  const desktopLayout = calculateLayout(160, 45);
+  assert(desktopLayout.leftSidebar.width === 28, 'Desktop screen provides 28-col left sidebar');
+  assert(desktopLayout.rightSidebar.width === 32, 'Desktop screen provides 32-col right sidebar');
+  assert(desktopLayout.centerPane.width === 100, 'Desktop screen provides 100-col center pane');
+
+  // Independent sidebar collapsing
+  const collapsedLeft = calculateLayout(120, 35, true, false);
+  assert(collapsedLeft.leftSidebar.hidden === true && collapsedLeft.leftSidebar.width === 0, 'Left sidebar collapsing zeroes width and hides box');
+  assert(collapsedLeft.centerPane.width === 120 - 28, 'Center pane expands by 24 cols when left sidebar is collapsed');
+  assert(collapsedLeft.centerPane.left === 0, 'Center pane starts at col 0 when left sidebar is collapsed');
+
+  const collapsedBoth = calculateLayout(120, 35, true, true);
+  assert(collapsedBoth.leftSidebar.hidden === true && collapsedBoth.rightSidebar.hidden === true, 'Both sidebars collapse when requested');
+  assert(collapsedBoth.centerPane.width === 120, 'Center pane occupies 100% width when both sidebars are collapsed');
+
+  // Non-wrapping Footer tests
+  const stripTags = str => str.replace(/{[^}]+}/g, '');
+  
+  const footer80 = buildFooterContent(80);
+  const footer80Plain = stripTags(footer80);
+  assert(footer80Plain.length <= 78, `Footer on 80-col terminal does not overflow (len=${footer80Plain.length} <= 78)`);
+  assert(footer80Plain.includes('[Tab] Focus'), 'Footer contains essential primary shortcuts');
+
+  const footer60 = buildFooterContent(60);
+  const footer60Plain = stripTags(footer60);
+  assert(footer60Plain.length <= 58, `Footer on 60-col terminal does not overflow (len=${footer60Plain.length} <= 58)`);
+
+  const footer120 = buildFooterContent(120);
+  const footer120Plain = stripTags(footer120);
+  assert(footer120Plain.length <= 118, `Footer on 120-col terminal does not overflow (len=${footer120Plain.length} <= 118)`);
+
+  // Non-wrapping Header tests
+  const headerOptions = { roomCode: 'TRF-TEST', localIp: '192.168.1.5', port: 7777, hostName: 'Alice', currentDir: '/home/turf/workspace/app' };
+  const header60 = buildHeaderContent(60, headerOptions);
+  const header60Plain = stripTags(header60);
+  assert(header60Plain.length <= 59, `Header on 60-col terminal does not overflow (len=${header60Plain.length} <= 59)`);
+
+  const header80 = buildHeaderContent(80, headerOptions);
+  const header80Plain = stripTags(header80);
+  assert(header80Plain.length <= 79, `Header on 80-col terminal does not overflow (len=${header80Plain.length} <= 79)`);
+
+  const header120 = buildHeaderContent(120, headerOptions);
+  const header120Plain = stripTags(header120);
+  assert(header120Plain.length <= 119, `Header on 120-col terminal does not overflow (len=${header120Plain.length} <= 119)`);
+  assert(header120.includes('Room:'), 'Wide header includes Room label');
+
+  // Adaptive Center Tab Label tests
+  const compactLabel = buildCenterLabel(40, 'turf', { turfStatus: 'working' }, null, true);
+  assert(compactLabel.includes('TURF (PLAN)*'), 'Compact center label includes active tab with working and plan badges');
+  assert(!compactLabel.includes('CODEX'), 'Compact center label hides inactive tabs when width < 46');
+
+  const mediumLabel = buildCenterLabel(60, 'cmdc', { cmdcStatus: 'working' }, null, false);
+  assert(mediumLabel.includes('[● CMDC*]'), 'Medium center label shows active CMDC tab with working indicator');
+  assert(mediumLabel.includes('CDX'), 'Medium center label shortens Codex to CDX');
+
+  const fullLabel = buildCenterLabel(90, 'turf', { turfStatus: 'idle', cmdcStatus: 'working' }, 'index.js', false);
+  assert(fullLabel.includes('[● TURF]'), 'Full center label highlights active Turf tab');
+  assert(fullLabel.includes('CMDC*'), 'Full center label shows CMDC working status');
+  assert(fullLabel.includes('FILE: index.js'), 'Full center label includes opened filename');
 
   console.log('\n--- E2E Tests Complete ---');
   console.log(`Passed: ${passed}, Failed: ${failed}`);
