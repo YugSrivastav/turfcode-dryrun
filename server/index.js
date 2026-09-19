@@ -177,8 +177,11 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
     console.error('Daemon Server Error:', err.message);
   });
 
-  server.listen(bindPort, '0.0.0.0', () => {
-    // Background daemon started silently
+  await new Promise((resolve, reject) => {
+    server.listen(bindPort, '0.0.0.0', () => {
+      resolve();
+    });
+    server.once('error', reject);
   });
 
   return { room, server, wss, port: bindPort };

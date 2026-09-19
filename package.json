@@ -11,6 +11,8 @@
     "demo": "node demo/run-demo.js"
   },
   "dependencies": {
+    "@xterm/addon-serialize": "^0.14.0",
+    "@xterm/headless": "^6.0.0",
     "blessed": "^0.1.81",
     "chalk": "^5.3.0",
     "cors": "^2.8.5",

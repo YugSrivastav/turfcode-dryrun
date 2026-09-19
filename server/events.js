@@ -30,6 +30,19 @@ export function handleEvent(ws, wss, room, data) {
     });
     return;
   }
+
+  if (data.type === 'agent:status') {
+    broadcast(wss, {
+      type: 'agent:status',
+      user: data.user || 'Unknown',
+      agent: data.agent,
+      status: data.status,
+      details: data.details || '',
+      task: data.task || '',
+      timestamp: Date.now()
+    });
+    return;
+  }
   
   const allowedTypes = ['intent:declare', 'tool:pre', 'tool:post', 'turn:complete', 'pty:input'];
   if (allowedTypes.includes(data.type)) {

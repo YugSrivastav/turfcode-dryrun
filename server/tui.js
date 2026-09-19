@@ -3,9 +3,144 @@ import { spawn, exec } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
+import fs from 'fs';
+import { ptyManager, safeEscape } from './pty_manager.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TURF_ROOT = path.resolve(__dirname, '..');
+
+export function buildFileTree(dir, baseDir = dir, depth = 0, maxDepth = 6) {
+  if (depth > maxDepth) return [];
+  const IGNORE = new Set(['.git', 'node_modules', 'dist', 'build', '.gemini', '.turbo', '.system_generated', '.next', 'coverage', '.cache']);
+  const items = [];
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    entries.sort((a, b) => {
+      if (a.isDirectory() && !b.isDirectory()) return -1;
+      if (!a.isDirectory() && b.isDirectory()) return 1;
+      return a.name.localeCompare(b.name);
+    });
+    for (const entry of entries) {
+      if (IGNORE.has(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      const relPath = path.relative(baseDir, fullPath).replace(/\\/g, '/');
+      if (entry.isDirectory()) {
+        items.push({
+          name: entry.name,
+          relPath,
+          fullPath,
+          isDir: true,
+          children: buildFileTree(fullPath, baseDir, depth + 1, maxDepth)
+        });
+      } else if (entry.isFile()) {
+        items.push({
+          name: entry.name,
+          relPath,
+          fullPath,
+          isDir: false
+        });
+      }
+    }
+  } catch (e) {}
+  return items;
+}
+
+export function flattenFileTree(nodes, expandedDirs, depth = 0, parentRel = null) {
+  let list = [];
+  for (const node of nodes) {
+    const isExpanded = expandedDirs.has(node.relPath);
+    list.push({
+      ...node,
+      depth,
+      parentRel,
+      isExpanded
+    });
+    if (node.isDir && isExpanded && node.children && node.children.length > 0) {
+      list = list.concat(flattenFileTree(node.children, expandedDirs, depth + 1, node.relPath));
+    }
+  }
+  return list;
+}
+
+function truncateString(str, maxW) {
+  if (!str) return '';
+  let w = 0;
+  let res = '';
+  for (const ch of str) {
+    const cw = blessed.unicode ? blessed.unicode.charWidth(ch) : 1;
+    if (w + cw > maxW) {
+      return res.slice(0, Math.max(0, res.length - 1)) + '…';
+    }
+    res += ch;
+    w += cw;
+  }
+  return res;
+}
+
+function padToWidth(taggedStr, targetWidth) {
+  const plain = taggedStr.replace(/{[^}]+}/g, '');
+  const currentW = blessed.unicode ? blessed.unicode.strWidth(plain) : plain.length;
+  if (currentW < targetWidth) {
+    return taggedStr + ' '.repeat(targetWidth - currentW);
+  }
+  return taggedStr;
+}
+
+export function getTruncatedPath(dirPath, maxLen = 22) {
+  if (!dirPath) return '';
+  if (dirPath.length <= maxLen) return dirPath;
+  const base = path.basename(dirPath);
+  if (base.length >= maxLen - 3) return '…' + base.slice(-(maxLen - 3));
+  return dirPath.slice(0, maxLen - base.length - 4) + '…/' + base;
+}
+
+export function formatTreeNode(node, maxInnerWidth = 24) {
+  const indentWidth = node.depth * 2;
+  const indent = '  '.repeat(node.depth);
+
+  if (node.isDir) {
+    const arrow = node.isExpanded ? '▾' : '▸';
+    const maxNameLen = Math.max(4, maxInnerWidth - indentWidth - 4);
+    const displayName = truncateString(node.name, maxNameLen);
+    const raw = `${indent} {bold}{yellow-fg}${arrow} ${displayName}/{/yellow-fg}{/bold}`;
+    return padToWidth(raw, maxInnerWidth);
+  }
+
+  const ext = path.extname(node.name).toLowerCase();
+  let color = 'white-fg';
+
+  if (['.js', '.mjs', '.cjs', '.ts', '.jsx', '.tsx'].includes(ext)) {
+    color = 'green-fg';
+  } else if (['.json', '.yaml', '.yml', '.toml'].includes(ext)) {
+    color = 'cyan-fg';
+  } else if (['.md', '.txt', '.log'].includes(ext)) {
+    color = 'magenta-fg';
+  } else if (['.html', '.css', '.scss'].includes(ext)) {
+    color = 'blue-fg';
+  } else if (['.png', '.jpg', '.jpeg', '.svg', '.gif', '.ico'].includes(ext)) {
+    color = 'cyan-fg';
+  } else if (['.sh', '.bash', '.ps1', '.bat', '.cmd'].includes(ext)) {
+    color = 'yellow-fg';
+  }
+
+  const maxNameLen = Math.max(4, maxInnerWidth - indentWidth - 5);
+  const displayName = truncateString(node.name, maxNameLen);
+  const raw = `${indent}   {${color}}▪ ${displayName}{/${color}}`;
+  return padToWidth(raw, maxInnerWidth);
+}
+
+export function getProjectFiles(dir, baseDir = dir) {
+  const tree = buildFileTree(dir, baseDir);
+  function extractFiles(nodes) {
+    let files = [];
+    for (const n of nodes) {
+      if (n.isDir && n.children) files = files.concat(extractFiles(n.children));
+      else if (!n.isDir) files.push(n.relPath);
+    }
+    return files;
+  }
+  return extractFiles(tree);
+}
 
 const CLIS = [
   { id: 'shell', name: 'PowerShell / Shell', prefix: process.platform === 'win32' ? 'PS' : '$', cmd: '' },
@@ -15,19 +150,89 @@ const CLIS = [
   { id: 'opencode', name: 'OpenCode (opencode)', prefix: 'opencode', cmd: 'opencode' }
 ];
 
-export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAddress, isPeer, serverInstance, wssInstance }) {
+export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAddress, isPeer, serverInstance, wssInstance, detectedAgents = { agy: true, codex: false } }) {
+  // Ensure process.stdin is clean of any leftover listeners/state from readline or previous runs
+  try {
+    process.stdin.removeAllListeners('newListener');
+    process.stdin.removeAllListeners('keypress');
+    process.stdin.removeAllListeners('data');
+    process.stdin.removeAllListeners('line');
+    for (const s of Object.getOwnPropertySymbols(process.stdin)) {
+      const desc = s.description || s.toString();
+      if (desc.includes('keypress') || desc.includes('escape')) {
+        delete process.stdin[s];
+      }
+    }
+  } catch (e) {}
+
+  // Switch to alternate screen buffer, clear screen, clear scrollback, home cursor
+  process.stdout.write('\x1b[?1049h\x1b[2J\x1b[3J\x1b[H');
+
   const screen = blessed.screen({
-    smartCSR: true,
+    smartCSR: false,
+    fastCSR: false,
+    useBCE: false,
     title: 'Turfcode',
-    dockBorders: true,
-    useBCE: true,
-    fullUnicode: true
+    dockBorders: false,
+    fullUnicode: true,
+    warnings: false,
+    mouse: true,
+    sendFocus: true,
+    cursor: {
+      artificial: false,
+      shape: 'line',
+      blink: true
+    }
   });
+
+  try {
+    screen.enableMouse();
+  } catch (e) {}
+
+  screen.program.alternateBuffer();
+  screen.program.clear();
+  screen.program.cursorPos(0, 0);
+  screen.clearRegion(0, screen.width, 0, screen.height);
 
   let activeCliIndex = 0;
   let currentCli = CLIS[activeCliIndex];
   let currentDir = repoPath;
-  let activeProc = null;
+  let activeCenterTab = 'term'; // 'term' | 'agy' | 'codex' | 'file'
+  let lastActiveCenterTab = 'term';
+  let activeTermProc = null;
+  let activeAgyProc = null;
+  let activeCodexProc = null;
+
+  const onUncaught = (err) => {
+    try {
+      const logLine = `[${new Date().toISOString()}] [TUI] Uncaught Exception: ${err.stack || err}\n`;
+      fs.appendFileSync(path.join(currentDir, 'turf-error.log'), logLine);
+      if (typeof getActiveLog === 'function') {
+        const al = getActiveLog();
+        if (al && al.log) {
+          al.log(`{red-fg}⚠️ Intercepted: ${err.message || err} (details in turf-error.log){/red-fg}`);
+          screen.render();
+        }
+      }
+    } catch (e) {}
+  };
+
+  const onUnhandled = (reason) => {
+    try {
+      const logLine = `[${new Date().toISOString()}] [TUI] Unhandled Rejection: ${reason && (reason.stack || reason)}\n`;
+      fs.appendFileSync(path.join(currentDir, 'turf-error.log'), logLine);
+      if (typeof getActiveLog === 'function') {
+        const al = getActiveLog();
+        if (al && al.log) {
+          al.log(`{red-fg}⚠️ Intercepted Rejection: ${reason && (reason.message || reason)} (details in turf-error.log){/red-fg}`);
+          screen.render();
+        }
+      }
+    } catch (e) {}
+  };
+
+  process.on('uncaughtException', onUncaught);
+  process.on('unhandledRejection', onUnhandled);
 
   const ws = new WebSocket(`ws://${hostAddress || '127.0.0.1'}:${port}`);
   
@@ -35,12 +240,16 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     ws.send(JSON.stringify({ type: 'peer:join', user: hostName, role: isPeer ? 'Peer' : 'Host' }));
   });
 
+  ws.on('error', (err) => {
+    // Avoid crashing on connection error
+  });
+
   const header = blessed.box({
     top: 0,
     left: 0,
     width: '100%',
     height: 1,
-    content: ` {bold}{green-fg} TURFCODE {/green-fg}{/bold}│ Room: {bold}{yellow-fg}${roomCode}{/yellow-fg}{/bold} │ WiFi Join: {bold}{yellow-fg}${localIp || hostAddress}:${port}{/yellow-fg}{/bold} │ User: {bold}{cyan-fg}${hostName}{/cyan-fg}{/bold}`,
+    content: '',
     tags: true,
     style: {
       fg: 'white',
@@ -50,10 +259,17 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   });
   screen.append(header);
 
+  function updateHeader() {
+    const availableWidth = screen.width || 100;
+    const maxPath = Math.max(15, availableWidth - 75);
+    header.setContent(` {bold}{149-fg}TURF{/149-fg}{white-fg}CODE{/white-fg}{/bold} │ Room: {bold}{yellow-fg}${roomCode}{/yellow-fg}{/bold} │ WiFi: {bold}{yellow-fg}${localIp || hostAddress}:${port}{/yellow-fg}{/bold} │ User: {bold}{cyan-fg}${hostName}{/cyan-fg}{/bold} │ Dir: {yellow-fg}${getTruncatedPath(currentDir, maxPath)}{/yellow-fg}`);
+  }
+  updateHeader();
+
   const leftSidebar = blessed.box({
     top: 1,
     left: 0,
-    width: 24,
+    width: 32,
     height: '100%-2',
   });
   screen.append(leftSidebar);
@@ -63,11 +279,49 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     top: 0,
     left: 0,
     width: '100%',
-    height: '40%',
-    label: '{bold}{cyan-fg} 👥 PEOPLE {/cyan-fg}{/bold}',
+    height: 7,
+    label: ' {bold}{cyan-fg}[PEOPLE]{/cyan-fg}{/bold} ',
     border: { type: 'line', fg: 'cyan' },
     tags: true,
-    content: ` {green-fg}●{/green-fg} {bold}${hostName}{/bold} (You)\n {grey-fg}(Solo session — invite peers with room code: ${roomCode}){/grey-fg}`
+    content: ` {green-fg}* {bold}${hostName}{/bold} (You){/green-fg}\n {grey-fg}(Solo — code: ${roomCode}){/grey-fg}`
+  });
+
+  const filesBox = blessed.box({
+    parent: leftSidebar,
+    top: 7,
+    left: 0,
+    width: '100%',
+    bottom: 0,
+    label: ' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ',
+    border: { type: 'line', fg: 'cyan' },
+    tags: true
+  });
+
+  const filesList = blessed.list({
+    parent: filesBox,
+    top: 0,
+    left: 0,
+    right: 1,
+    height: '100%-2',
+    keys: false,
+    mouse: true,
+    vi: false,
+    tags: true,
+    style: {
+      selected: {
+        bg: 'blue',
+        fg: 'white',
+        bold: true
+      },
+      item: {
+        fg: 'white'
+      }
+    },
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
   });
 
   function updatePeopleBox(peers) {
@@ -75,51 +329,26 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     let content = '';
     peers.forEach(p => {
       if (p.name === hostName) {
-        content += ` {green-fg}●{/green-fg} {bold}${p.name} (You){/bold}\n`;
+        content += ` {green-fg}* {bold}${p.name} (You){/bold}{/green-fg}\n`;
       } else {
-        content += ` {green-fg}●{/green-fg} ${p.name} {cyan-fg}[${p.role}]{/cyan-fg}\n`;
+        content += ` {cyan-fg}* ${p.name} [${p.role}]{/cyan-fg}\n`;
       }
     });
     peopleBox.setContent(content);
     screen.render();
   }
 
-  const intentBox = blessed.box({
-    parent: leftSidebar,
-    top: '40%',
-    left: 0,
-    width: '100%',
-    height: '100%-3',
-    label: '{bold}{yellow-fg} 🔒 INTENT {/yellow-fg}{/bold}',
-    border: { type: 'line', fg: 'yellow' },
-    tags: true,
-    content: `{bold}ACTIVE TURFS:{/bold}\n {grey-fg}(No active file locks){/grey-fg}\n\n{bold}LIVE ALERTS:{/bold}\n {grey-fg}(No alerts){/grey-fg}`
-  });
-
-  const collapseBtn = blessed.button({
-    parent: leftSidebar,
-    bottom: 0,
-    left: 0,
-    width: '100%',
-    height: 3,
-    content: ' {bold}«{/bold}',
-    border: { type: 'line', fg: 'grey' },
-    tags: true,
-    mouse: true,
-    style: {
-      hover: { bg: 'grey' },
-      focus: { bg: 'grey' }
-    }
-  });
-
   const centerPane = blessed.box({
     top: 1,
-    left: 24,
-    width: '100%-62',
+    left: 32,
+    width: '100%-64',
     height: '100%-2',
-    label: `{bold} TERMINAL {/bold}│ {yellow-fg}${currentDir}{/yellow-fg}`,
+    label: ' [TERMINAL]  FILE (F4) ',
     border: { type: 'line', fg: 'green' },
-    tags: true
+    style: {
+      border: { fg: 'green' },
+      label: { fg: 'green', bold: true }
+    }
   });
   screen.append(centerPane);
 
@@ -127,99 +356,751 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   function toggleSidebar() {
     isSidebarCollapsed = !isSidebarCollapsed;
     if (isSidebarCollapsed) {
-      leftSidebar.width = 4;
-      peopleBox.hide();
-      intentBox.hide();
-      collapseBtn.setContent(' {bold}»{/bold}');
-      centerPane.left = 4;
-      centerPane.width = '100%-42';
+      leftSidebar.hide();
+      centerPane.left = 0;
+      centerPane.width = '100%-32';
     } else {
-      leftSidebar.width = 24;
-      peopleBox.show();
-      intentBox.show();
-      collapseBtn.setContent(' {bold}«{/bold}');
-      centerPane.left = 24;
-      centerPane.width = '100%-62';
+      leftSidebar.show();
+      centerPane.left = 32;
+      centerPane.width = '100%-64';
     }
+    screen.realloc();
     screen.render();
   }
-  collapseBtn.on('press', toggleSidebar);
 
-  const terminalLog = blessed.log({
+  screen.on('resize', () => {
+    updateHeader();
+    if (isSidebarCollapsed) {
+      centerPane.left = 0;
+      centerPane.width = '100%-32';
+    } else {
+      centerPane.left = 32;
+      centerPane.width = '100%-64';
+    }
+    screen.realloc();
+    screen.render();
+  });
+
+  const termLog = blessed.box({
     parent: centerPane,
     top: 0,
     left: 0,
     width: '100%-2',
     height: '100%-3',
     scrollable: true,
-    alwaysScroll: true,
+    alwaysScroll: false,
     tags: true,
     keys: true,
-    vi: true
+    vi: true,
+    mouse: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
+  });
+  termLog.log = function(msg) {
+    const prev = this.getContent() || '';
+    this.setContent(prev ? prev + '\n' + msg : msg);
+    this.setScrollPerc(100);
+    screen.render();
+  };
+
+  const agyLog = blessed.box({
+    parent: centerPane,
+    top: 0,
+    left: 0,
+    width: '100%-2',
+    height: '100%-3',
+    scrollable: true,
+    alwaysScroll: false,
+    tags: true,
+    keys: true,
+    vi: true,
+    mouse: true,
+    hidden: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
+  });
+  agyLog.log = function(msg) {
+    const prev = this.getContent() || '';
+    this.setContent(prev ? prev + '\n' + msg : msg);
+    this.setScrollPerc(100);
+    screen.render();
+  };
+
+  const codexLog = blessed.box({
+    parent: centerPane,
+    top: 0,
+    left: 0,
+    width: '100%-2',
+    height: '100%-3',
+    scrollable: true,
+    alwaysScroll: false,
+    tags: true,
+    keys: true,
+    vi: true,
+    mouse: true,
+    hidden: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
+  });
+  codexLog.log = function(msg) {
+    const prev = this.getContent() || '';
+    this.setContent(prev ? prev + '\n' + msg : msg);
+    this.setScrollPerc(100);
+    screen.render();
+  };
+
+  const fileViewerLog = blessed.box({
+    parent: centerPane,
+    top: 0,
+    left: 0,
+    width: '100%-2',
+    height: '100%-2',
+    scrollable: true,
+    alwaysScroll: false,
+    keys: true,
+    vi: true,
+    mouse: true,
+    tags: false,
+    hidden: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'cyan' }
+    }
+  });
+
+  let currentOpenedFile = null;
+
+  function getActiveLog() {
+    if (activeCenterTab === 'codex') return codexLog;
+    if (activeCenterTab === 'agy') return agyLog;
+    if (activeCenterTab === 'file') return fileViewerLog;
+    return termLog;
+  }
+
+  function getActiveProc() {
+    if (activeCenterTab === 'codex') return activeCodexProc;
+    if (activeCenterTab === 'agy') return activeAgyProc;
+    return activeTermProc;
+  }
+
+  function formatTabBadge(name, status) {
+    if (status === 'working') return `${name} (Working)`;
+    if (status === 'awaiting_input') return `${name} (Input?)`;
+    if (status === 'done') return `${name} (Done)`;
+    return name;
+  }
+
+  function updateCenterLabel() {
+    const termStatus = ptyManager.getStatus('term');
+    const agyStatus = ptyManager.getStatus('agy');
+    const codexStatus = ptyManager.getStatus('codex');
+
+    const termLabel = termStatus === 'working' ? 'TERM*' : 'TERM';
+    const agyLabel = formatTabBadge('AGY', agyStatus);
+    const codexLabel = formatTabBadge('CODEX', codexStatus);
+    
+    const fileBase = currentOpenedFile ? path.basename(currentOpenedFile) : null;
+    const truncatedBase = fileBase ? truncateString(fileBase, 12) : null;
+    const fileLabel = truncatedBase ? `FILE: ${truncatedBase} (F4)` : 'FILE (F4)';
+    
+    if (activeCenterTab === 'file') {
+      centerPane.style.border.fg = 'yellow';
+      if (centerPane.style.label) centerPane.style.label.fg = 'yellow';
+      centerPane.setLabel(` ○ ${termLabel} │ ○ ${agyLabel} │ ○ ${codexLabel} │ [● ${fileLabel}] `);
+    } else if (activeCenterTab === 'codex') {
+      centerPane.style.border.fg = 'cyan';
+      if (centerPane.style.label) centerPane.style.label.fg = 'cyan';
+      centerPane.setLabel(` ○ ${termLabel} │ ○ ${agyLabel} │ [● ${codexLabel}] │ ${fileLabel} `);
+    } else if (activeCenterTab === 'agy') {
+      centerPane.style.border.fg = 'green';
+      if (centerPane.style.label) centerPane.style.label.fg = 'green';
+      centerPane.setLabel(` ○ ${termLabel} │ [● ${agyLabel}] │ ○ ${codexLabel} │ ${fileLabel} `);
+    } else {
+      centerPane.style.border.fg = 'green';
+      if (centerPane.style.label) centerPane.style.label.fg = 'green';
+      centerPane.setLabel(` [● ${termLabel}] │ ○ ${agyLabel} │ ○ ${codexLabel} │ ${fileLabel} `);
+    }
+  }
+
+  function showCenterTab(tabName = 'term') {
+    if (tabName !== 'file') {
+      lastActiveCenterTab = tabName;
+    }
+    activeCenterTab = tabName;
+    fileViewerLog.hide();
+
+    termLog.hide();
+    agyLog.hide();
+    codexLog.hide();
+
+    if (tabName === 'codex') {
+      codexLog.show();
+      const content = ptyManager.getScreenContent('codex');
+      if (content) codexLog.setContent(content);
+      codexLog.setScrollPerc(100);
+      promptPrefix.setContent('{bold}{cyan-fg}CODEX>{/cyan-fg}{/bold} ');
+      promptPrefix.width = 7;
+      terminalInput.left = 8;
+      terminalInput.width = '100%-10';
+    } else if (tabName === 'agy') {
+      agyLog.show();
+      const content = ptyManager.getScreenContent('agy');
+      if (content) agyLog.setContent(content);
+      agyLog.setScrollPerc(100);
+      promptPrefix.setContent('{bold}{149-fg}AGY>{/149-fg}{/bold} ');
+      promptPrefix.width = 5;
+      terminalInput.left = 6;
+      terminalInput.width = '100%-8';
+    } else {
+      activeCenterTab = 'term';
+      termLog.show();
+      const content = ptyManager.getScreenContent('term');
+      if (content) termLog.setContent(content);
+      termLog.setScrollPerc(100);
+      promptPrefix.setContent('{bold}{149-fg}>{/149-fg}{/bold} ');
+      promptPrefix.width = 2;
+      terminalInput.left = 3;
+      terminalInput.width = '100%-5';
+    }
+    focusIndex = 0;
+
+    promptPrefix.show();
+    terminalInput.show();
+    updateCenterLabel();
+    focusTerminal();
+  }
+
+  function showAgentTab(agentName = 'agy') {
+    showCenterTab(agentName);
+  }
+
+  function showTerminalTab() {
+    showCenterTab('term');
+  }
+
+  function openFileInViewer(relPath) {
+    if (!relPath) return;
+    stopInputReading();
+    screen.program.hideCursor();
+
+    currentOpenedFile = relPath;
+    const fullPath = path.resolve(currentDir, relPath);
+    let content = '';
+    try {
+      if (!fs.existsSync(fullPath)) {
+        content = `[File not found: ${fullPath}]`;
+      } else {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          content = `[Directory: ${relPath}]\n\nSelect a file from the [FILES] list to read its contents.`;
+        } else if (stat.size > 2000000) {
+          content = `[File too large to preview (${Math.round(stat.size / 1024)} KB)]`;
+        } else {
+          content = fs.readFileSync(fullPath, 'utf8');
+        }
+      }
+    } catch (e) {
+      content = `[Error reading file: ${e.message}]`;
+    }
+
+    const lines = content.split('\n');
+    const maxLineNumWidth = Math.max(String(lines.length).length, 3);
+    const formatted = lines.map((l, idx) => {
+      const numStr = String(idx + 1).padStart(maxLineNumWidth, ' ');
+      return `${numStr} │ ${l.replace(/\r$/, '')}`;
+    }).join('\n');
+
+    fileViewerLog.setContent(formatted);
+    fileViewerLog.scrollTo(0);
+
+    activeCenterTab = 'file';
+    termLog.hide();
+    agyLog.hide();
+    codexLog.hide();
+    promptPrefix.hide();
+    terminalInput.hide();
+    fileViewerLog.show();
+    updateCenterLabel();
+    focusIndex = 0;
+    updateFocusStyles();
+    fileViewerLog.focus();
+    screen.realloc();
+    screen.render();
+  }
+
+  function toggleCenterTab() {
+    if (activeCenterTab === 'file') {
+      showCenterTab(lastActiveCenterTab || 'term');
+    } else {
+      if (currentOpenedFile) {
+        openFileInViewer(currentOpenedFile);
+      } else {
+        focusFiles();
+        getActiveLog().log(`{cyan-fg}SYSTEM>{/cyan-fg} {yellow-fg}Select a file from [FILES] and press Enter to view it.{/yellow-fg}`);
+        screen.render();
+      }
+    }
+  }
+
+  let fileTreeData = [];
+  let visibleFileList = [];
+  let expandedDirs = new Set();
+  let isTreeInitialized = false;
+
+  function refreshFileList(preserveSelection = true) {
+    const prevSelectedRel = (visibleFileList && visibleFileList[filesList.selected]) 
+      ? visibleFileList[filesList.selected].relPath 
+      : null;
+
+    fileTreeData = buildFileTree(currentDir, currentDir);
+
+    // Auto-expand top-level folders on first load
+    if (!isTreeInitialized) {
+      expandedDirs.clear();
+      for (const item of fileTreeData) {
+        if (item.isDir) {
+          expandedDirs.add(item.relPath);
+        }
+      }
+      isTreeInitialized = true;
+    }
+
+    visibleFileList = flattenFileTree(fileTreeData, expandedDirs);
+
+    if (visibleFileList.length === 0) {
+      filesList.setItems([' {grey-fg}(no files found){/grey-fg}']);
+    } else {
+      const formattedItems = visibleFileList.map(node => formatTreeNode(node));
+      filesList.setItems(formattedItems);
+
+      if (preserveSelection && prevSelectedRel) {
+        const newIndex = visibleFileList.findIndex(x => x.relPath === prevSelectedRel);
+        if (newIndex !== -1) {
+          filesList.select(newIndex);
+        }
+      }
+    }
+    screen.render();
+  }
+  refreshFileList();
+
+  function handleFileActivation(idx) {
+    if (idx === undefined || idx === null) idx = filesList.selected;
+    const item = visibleFileList[idx];
+    if (!item) return;
+
+    if (item.isDir) {
+      if (expandedDirs.has(item.relPath)) {
+        expandedDirs.delete(item.relPath);
+      } else {
+        expandedDirs.add(item.relPath);
+      }
+      refreshFileList(true);
+    } else {
+      openFileInViewer(item.relPath);
+    }
+  }
+
+  function handleFileLeftKey() {
+    const idx = filesList.selected;
+    const item = visibleFileList[idx];
+    if (!item) return;
+
+    if (item.isDir && expandedDirs.has(item.relPath)) {
+      // Collapse expanded folder
+      expandedDirs.delete(item.relPath);
+      refreshFileList(true);
+    } else if (item.parentRel) {
+      // Move to parent folder
+      const parentIdx = visibleFileList.findIndex(x => x.isDir && x.relPath === item.parentRel);
+      if (parentIdx !== -1) {
+        filesList.select(parentIdx);
+        screen.render();
+      }
+    }
+  }
+
+  function handleFileRightKey() {
+    const idx = filesList.selected;
+    const item = visibleFileList[idx];
+    if (!item) return;
+
+    if (item.isDir) {
+      if (!expandedDirs.has(item.relPath)) {
+        // Expand collapsed folder
+        expandedDirs.add(item.relPath);
+        refreshFileList(true);
+      } else {
+        // Step into first child if present
+        if (idx + 1 < visibleFileList.length && visibleFileList[idx + 1].parentRel === item.relPath) {
+          filesList.select(idx + 1);
+          screen.render();
+        }
+      }
+    } else {
+      openFileInViewer(item.relPath);
+    }
+  }
+
+  filesList.on('select', (item, index) => {
+    handleFileActivation(index);
   });
 
   function printWelcomeBanner() {
-    terminalLog.log(`{cyan-fg}┌─────────────────────────────────────────────────────────────┐{/cyan-fg}`);
-    terminalLog.log(`{cyan-fg}│{/cyan-fg}  {bold}{white-fg}TURFCODE TERMINAL v1.0{/white-fg}{/bold} — {green-fg}READY{/green-fg}                              {cyan-fg}│{/cyan-fg}`);
-    terminalLog.log(`{cyan-fg}│{/cyan-fg}  Directory: {yellow-fg}${currentDir}{/yellow-fg}                                     {cyan-fg}│{/cyan-fg}`);
-    terminalLog.log(`{cyan-fg}│{/cyan-fg}  Run any shell command directly (git, npm, agy, claude)     {cyan-fg}│{/cyan-fg}`);
-    terminalLog.log(`{cyan-fg}│{/cyan-fg}  [/chat] Team Chat  │  [F5] Demo  │  [o] Web UI             {cyan-fg}│{/cyan-fg}`);
-    terminalLog.log(`{cyan-fg}└─────────────────────────────────────────────────────────────┘{/cyan-fg}\n`);
+    termLog.log(`{bold}{149-fg}TURFCODE SHELL{/149-fg}{/bold} {grey-fg}│ Run terminal commands or type /agy, /codex to start AI agents{/grey-fg}`);
+    agyLog.log(`{bold}{149-fg}ANTIGRAVITY AGENT{/149-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
+    codexLog.log(`{bold}{cyan-fg}OPENAI CODEX AGENT{/cyan-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
   }
   printWelcomeBanner();
 
-  const promptStr = process.platform === 'win32' ? 'PS>' : '$>';
-  
   const promptPrefix = blessed.text({
     parent: centerPane,
-    bottom: 0,
+    bottom: 1,
     left: 1,
+    width: 2,
+    shrink: true,
     tags: true,
-    content: `{green-fg}${promptStr}{/green-fg} `
+    content: '{bold}{149-fg}>{/149-fg}{/bold} '
   });
 
   const terminalInput = blessed.textbox({
     parent: centerPane,
-    bottom: 0,
-    left: promptStr.length + 2,
-    width: '100%-15',
+    bottom: 1,
+    left: 3,
+    width: '100%-5',
     height: 1,
     keys: true,
     mouse: true,
-    inputOnFocus: true,
     style: {
       fg: 'white',
       bg: 'black'
     }
   });
 
+  const AVAILABLE_COMMANDS = [
+    { cmd: '/usage', desc: 'View session stats, turns, token count & active config' },
+    { cmd: '/model', desc: 'Set or view model (e.g. /model gpt-4o, /model o3-mini)' },
+    { cmd: '/effort', desc: 'Set reasoning effort (/effort low | medium | high)' },
+    { cmd: '/sandbox', desc: 'Set sandbox mode (/sandbox workspace-write | read-only)' },
+    { cmd: '/new', desc: 'Reset agent session memory and start a fresh session' },
+    { cmd: '/resume', desc: 'Resume a past session ID (/resume <id>)' },
+    { cmd: '/diff', desc: 'Inspect git diff of workspace changes made by agent' },
+    { cmd: '/kill', desc: 'Terminate running agent process or shell command' },
+    { cmd: '/codex', desc: 'Switch to Codex tab or run prompt (/codex <prompt>)' },
+    { cmd: '/agy', desc: 'Switch to Antigravity tab or run prompt (/agy <prompt>)' },
+    { cmd: '/term', desc: 'Switch to Shell terminal or run command (/term <command>)' },
+    { cmd: '/chat', desc: 'Send message to team chat or focus chat (/chat <msg>)' },
+    { cmd: '/files', desc: 'Focus workspace file explorer [F3]' },
+    { cmd: '/web', desc: 'Open collaborative web preview browser [Ctrl+O]' },
+    { cmd: '/help', desc: 'Show full command documentation and shortcuts' }
+  ];
+
+  let paletteFilteredItems = [...AVAILABLE_COMMANDS];
+
+  const commandPaletteBox = blessed.list({
+    parent: centerPane,
+    bottom: 2,
+    left: 3,
+    width: 74,
+    height: 9,
+    hidden: true,
+    tags: true,
+    keys: false,
+    mouse: true,
+    border: { type: 'line', fg: '149' },
+    style: {
+      selected: { bg: '149', fg: 'black', bold: true },
+      item: { fg: 'white' },
+      border: { fg: '149' }
+    },
+    label: ' {bold}{149-fg}COMMANDS{/149-fg}{/bold} {grey-fg}[↑/↓] nav [Tab] select [Esc] close{/grey-fg} '
+  });
+
+  function renderCommandPalette(filterText = '') {
+    const query = filterText.toLowerCase().trim();
+    if (query.startsWith('/model')) {
+      const modelItems = activeCenterTab === 'agy' ? [
+        { cmd: '/model gemini-3.8-flash-high', desc: 'Gemini 3.8 Flash (High reasoning - fastest)' },
+        { cmd: '/model gemini-3.8-flash-medium', desc: 'Gemini 3.8 Flash (Medium reasoning)' },
+        { cmd: '/model gemini-3.7-flash-high', desc: 'Gemini 3.7 Flash (High reasoning)' },
+        { cmd: '/model gemini-3.6-flash-high', desc: 'Gemini 3.6 Flash (High reasoning)' },
+        { cmd: '/model gemini-3.1-pro-high', desc: 'Gemini 3.1 Pro (Deep reasoning)' },
+        { cmd: '/model claude-sonnet-4-6', desc: 'Claude Sonnet 4.6 (Thinking)' },
+        { cmd: '/model claude-opus-4-6-thinking', desc: 'Claude Opus 4.6 (Thinking)' },
+        { cmd: '/model gpt-oss-120b-medium', desc: 'GPT-OSS 120B (Medium)' }
+      ] : [
+        { cmd: '/model o3-mini', desc: 'OpenAI o3-mini (High reasoning, fast)' },
+        { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o (Fast multimodal)' },
+        { cmd: '/model o1', desc: 'OpenAI o1 (Full reasoning)' }
+      ];
+      paletteFilteredItems = modelItems.filter(c => !query || c.cmd.toLowerCase().includes(query) || query === '/model' || query === '/model ');
+      if (paletteFilteredItems.length === 0) paletteFilteredItems = modelItems;
+    } else {
+      paletteFilteredItems = AVAILABLE_COMMANDS.filter(c => {
+        if (!query || query === '/') return true;
+        return c.cmd.toLowerCase().startsWith(query) || (query.length > 2 && c.cmd.toLowerCase().includes(query));
+      });
+    }
+
+    if (paletteFilteredItems.length === 0) {
+      if (!commandPaletteBox.hidden) {
+        commandPaletteBox.hide();
+        screen.render();
+      }
+      return;
+    }
+
+    const items = paletteFilteredItems.map(c => {
+      const padLen = c.cmd.length > 12 ? c.cmd.length + 2 : 14;
+      return `{bold}${c.cmd.padEnd(padLen)}{/bold} {grey-fg}${c.desc}{/grey-fg}`;
+    });
+    commandPaletteBox.setItems(items);
+    commandPaletteBox.select(0);
+    commandPaletteBox.show();
+    commandPaletteBox.setFront();
+    screen.render();
+  }
+
+  function hideCommandPalette() {
+    if (!commandPaletteBox.hidden) {
+      commandPaletteBox.hide();
+      screen.render();
+    }
+  }
+
+  function applySelectedPaletteCommand() {
+    const idx = commandPaletteBox.selected;
+    const selected = paletteFilteredItems[idx];
+    if (selected) {
+      const val = selected.cmd.includes(' ') ? selected.cmd : selected.cmd + ' ';
+      terminalInput.setValue(val);
+      hideCommandPalette();
+      focusTerminal();
+      screen.render();
+    }
+  }
+
+  commandPaletteBox.on('select', (item, index) => {
+    const selected = paletteFilteredItems[index];
+    if (selected) {
+      const val = selected.cmd.includes(' ') ? selected.cmd : selected.cmd + ' ';
+      terminalInput.setValue(val);
+      hideCommandPalette();
+      focusTerminal();
+      screen.render();
+    }
+  });
+
+  function updatePaletteFromInput() {
+    if (focusIndex !== 0) {
+      hideCommandPalette();
+      return;
+    }
+    const val = terminalInput.value || '';
+    if (val.startsWith('/') && (!val.includes(' ') || val.startsWith('/model '))) {
+      renderCommandPalette(val);
+    } else {
+      hideCommandPalette();
+    }
+  }
+
+  terminalInput.on('keypress', (ch, key) => {
+    process.nextTick(() => {
+      updatePaletteFromInput();
+    });
+  });
+
   const rightSidebar = blessed.box({
     top: 1,
     right: 0,
-    width: 38,
+    width: 32,
     height: '100%-2',
   });
   screen.append(rightSidebar);
+
+  const intentBox = blessed.box({
+    parent: rightSidebar,
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: 9,
+    label: ' {bold}{yellow-fg}● INTENT{/yellow-fg}{/bold} {grey-fg}│ QUEUE [F2]{/grey-fg} ',
+    border: { type: 'line', fg: 'yellow' },
+    tags: true,
+    mouse: true,
+    content: ' {bold}ACTIVE TURFS:{/bold}\n  {grey-fg}(No active locks){/grey-fg}\n\n {bold}ALERTS:{/bold}\n  {grey-fg}(No alerts){/grey-fg}'
+  });
+
+  const peerAgents = new Map();
+
+  function updateIntentBox() {
+    let content = ' {bold}ACTIVE TURFS:{/bold}\n  {grey-fg}(No active locks){/grey-fg}\n\n';
+    content += ' {bold}AI AGENTS:{/bold}\n';
+    
+    let hasAgents = false;
+    const agySt = ptyManager.getStatus('agy');
+    const codexSt = ptyManager.getStatus('codex');
+
+    if (agySt !== 'idle') {
+      const color = agySt === 'working' ? 'green-fg' : (agySt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
+      content += `  {${color}}● ${hostName}: AGY [${agySt.toUpperCase()}]{/${color}}\n`;
+      hasAgents = true;
+    }
+    if (codexSt !== 'idle') {
+      const color = codexSt === 'working' ? 'green-fg' : (codexSt === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
+      content += `  {${color}}● ${hostName}: CODEX [${codexSt.toUpperCase()}]{/${color}}\n`;
+      hasAgents = true;
+    }
+
+    for (const [_, info] of peerAgents.entries()) {
+      if (info.user !== hostName && info.status !== 'idle') {
+        const color = info.status === 'working' ? 'green-fg' : (info.status === 'awaiting_input' ? 'yellow-fg' : 'cyan-fg');
+        content += `  {${color}}● ${info.user}: ${info.agent.toUpperCase()} [${info.status.toUpperCase()}]{/${color}}\n`;
+        hasAgents = true;
+      }
+    }
+
+    if (!hasAgents) {
+      content += '  {grey-fg}(No agents running){/grey-fg}\n';
+    }
+
+    intentBox.setContent(content);
+    screen.render();
+  }
+
+  ptyManager.on('agent:msg', ({ tabId, type, text }) => {
+    try {
+      let target = termLog;
+      if (tabId === 'agy') target = agyLog;
+      else if (tabId === 'codex') target = codexLog;
+      if (text) {
+        target.log(text);
+        screen.render();
+      }
+    } catch (e) {
+      try {
+        fs.appendFileSync(path.join(currentDir, 'turf-error.log'), `[agent:msg error] ${e.stack || e}\n`);
+      } catch (err) {}
+    }
+  });
+
+  ptyManager.on('screen', ({ tabId, content }) => {
+    if (tabId === 'term' && content) {
+      termLog.setContent(content);
+      screen.render();
+    }
+  });
+
+  let activeStreamingTab = null;
+  ptyManager.on('agent:stream', ({ tabId, text }) => {
+    try {
+      let target = tabId === 'agy' ? agyLog : codexLog;
+      if (activeStreamingTab !== tabId) {
+        const colorTag = tabId === 'agy' ? '149-fg' : 'cyan-fg';
+        target.log(`{bold}{${colorTag}}💬 ${tabId.toUpperCase()}:{/${colorTag}}{/bold} `);
+        activeStreamingTab = tabId;
+      }
+      const prev = target.getContent() || '';
+      target.setContent(prev + safeEscape(text));
+      target.setScrollPerc(100);
+      screen.render();
+    } catch (e) {
+      try {
+        fs.appendFileSync(path.join(currentDir, 'turf-error.log'), `[agent:stream error] ${e.stack || e}\n`);
+      } catch (err) {}
+    }
+  });
+
+  ptyManager.on('status', ({ tabId, status, details }) => {
+    if (status === 'done' || status === 'idle') {
+      activeStreamingTab = null;
+    }
+    updateCenterLabel();
+    updateIntentBox();
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'agent:status',
+        user: hostName,
+        agent: tabId,
+        status,
+        details: details || '',
+        timestamp: Date.now()
+      }));
+    }
+    screen.render();
+  });
+
+  ptyManager.on('exit', ({ tabId, exitCode }) => {
+    activeStreamingTab = null;
+    let target = termLog;
+    if (tabId === 'agy') target = agyLog;
+    else if (tabId === 'codex') target = codexLog;
+
+    if (tabId !== 'term') {
+      if (exitCode === 0) {
+        const stats = ptyManager.getUsageStats(tabId);
+        target.log(`{bold}{green-fg}✓ [${tabId.toUpperCase()} Completed Turn #${stats.turnCount}]{/green-fg}{/bold}`);
+        if (stats.sessionId && stats.sessionId !== '(No active session ID yet)') {
+          target.log(`{grey-fg}Session ID: ${stats.sessionId.slice(0, 18)}... │ Type follow-up prompt to continue session context{/grey-fg}`);
+        }
+      } else if (exitCode !== null) {
+        target.log(`{bold}{grey-fg}[${tabId.toUpperCase()} Process exited with code ${exitCode}]{/grey-fg}{/bold}`);
+      }
+    }
+    updateCenterLabel();
+    updateIntentBox();
+    screen.render();
+  });
 
   const queueBox = blessed.box({
     parent: rightSidebar,
     top: 0,
     left: 0,
     width: '100%',
-    height: '35%',
-    label: '{bold}{magenta-fg} 📋 FILE QUEUE {/magenta-fg}{/bold}',
+    height: 9,
+    label: ' {grey-fg}INTENT [F2] │{/grey-fg} {bold}{magenta-fg}● QUEUE{/magenta-fg}{/bold} ',
     border: { type: 'line', fg: 'magenta' },
     tags: true,
-    content: ` {grey-fg}(Queue is empty — 0 agents waiting){/grey-fg}`
+    mouse: true,
+    content: '  {grey-fg}(0 agents waiting){/grey-fg}'
   });
+
+  let rightSidebarView = 'intent';
+  queueBox.hide();
+
+  function toggleRightSection() {
+    if (rightSidebarView === 'intent') {
+      rightSidebarView = 'queue';
+      intentBox.hide();
+      queueBox.show();
+    } else {
+      rightSidebarView = 'intent';
+      queueBox.hide();
+      intentBox.show();
+    }
+    screen.render();
+  }
+
+  intentBox.on('click', toggleRightSection);
+  queueBox.on('click', toggleRightSection);
 
   const chatLogBox = blessed.log({
     parent: rightSidebar,
-    top: '35%',
+    top: 9,
     left: 0,
     width: '100%',
     bottom: 3,
-    label: '{bold}{blue-fg} 💬 TEAM CHAT {/blue-fg}{/bold}',
+    label: ' {bold}{blue-fg}[TEAM CHAT]{/blue-fg}{/bold} ',
     border: { type: 'line', fg: 'blue' },
     scrollable: true,
     alwaysScroll: true,
@@ -235,21 +1116,28 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     left: 0,
     width: '100%',
     height: 3,
-    label: '{bold} ✍️ Write Message (/term to return) {/bold}',
+    label: ' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ',
     border: { type: 'line', fg: 'cyan' },
     tags: true,
     mouse: true
   });
 
-  const chatInput = blessed.textbox({
+  const chatInputPrompt = blessed.text({
     parent: chatInputBox,
     top: 0,
     left: 1,
-    width: '100%-4',
+    tags: true,
+    content: `{cyan-fg}💬 >{/cyan-fg} `
+  });
+
+  const chatInput = blessed.textbox({
+    parent: chatInputBox,
+    top: 0,
+    left: 6,
+    width: '100%-8',
     height: 1,
     keys: true,
     mouse: true,
-    inputOnFocus: true,
     style: {
       fg: 'white',
       bg: 'black'
@@ -262,7 +1150,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     width: '100%',
     height: 1,
     tags: true,
-    content: ` {bold}{yellow-fg}[Tab]{/yellow-fg}{/bold} Focus Chat/Term │ {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo │ {bold}{yellow-fg}[o]{/yellow-fg}{/bold} Web UI │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Cancel/Quit `,
+    content: ` {bold}{149-fg}[Tab]{/149-fg}{/bold} Switch Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{149-fg}[/agy]{/149-fg}{/bold} AGY │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[F4]{/yellow-fg}{/bold} Term/File │ {bold}{yellow-fg}[F2]{/yellow-fg}{/bold} Intent │ {bold}{yellow-fg}[Ctrl+B]{/yellow-fg}{/bold} Sidebar │ {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} Demo │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `,
     style: {
       fg: 'white',
       bg: 'black'
@@ -280,162 +1168,799 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         screen.render();
       } else if (data.type === 'peer:update') {
         updatePeopleBox(data.peers);
+      } else if (data.type === 'agent:status') {
+        if (data.user && data.agent) {
+          peerAgents.set(`${data.user}:${data.agent}`, data);
+          updateIntentBox();
+          if (data.status === 'working' && data.user !== hostName) {
+            chatLogBox.log(` {yellow-fg}⚡ [AI] ${data.user} started ${data.agent.toUpperCase()}${data.details ? ': ' + data.details : ''}{/yellow-fg}`);
+            screen.render();
+          }
+        }
       }
     } catch (e) {}
   });
 
-  let focusIndex = 0;
+  let focusIndex = 0; // 0: Center Pane (Terminal/File), 1: Team Chat, 2: Files List
   
+  function stopInputReading() {
+    try {
+      if (terminalInput && terminalInput._reading) {
+        terminalInput.cancel();
+      }
+    } catch (e) {}
+    try {
+      if (chatInput && chatInput._reading) {
+        chatInput.cancel();
+      }
+    } catch (e) {}
+    screen.grabKeys = false;
+  }
+
   function focusTerminal() {
     focusIndex = 0;
     updateFocusStyles();
-    terminalInput.focus();
-    terminalInput.readInput();
+    if (activeCenterTab === 'file') {
+      stopInputReading();
+      screen.program.hideCursor();
+      fileViewerLog.focus();
+    } else {
+      try {
+        if (chatInput && chatInput._reading) chatInput.cancel();
+      } catch (e) {}
+      try {
+        if (terminalInput && terminalInput._reading) terminalInput.cancel();
+      } catch (e) {}
+      screen.grabKeys = false;
+      terminalInput.focus();
+      terminalInput.readInput();
+      screen.program.showCursor();
+    }
     screen.render();
   }
 
   function focusChat() {
     focusIndex = 1;
+    hideCommandPalette();
     updateFocusStyles();
+    try {
+      if (terminalInput && terminalInput._reading) terminalInput.cancel();
+    } catch (e) {}
+    screen.grabKeys = false;
     chatInput.focus();
     chatInput.readInput();
+    screen.program.showCursor();
+    screen.render();
+  }
+
+  function focusFiles() {
+    focusIndex = 2;
+    hideCommandPalette();
+    updateFocusStyles();
+    stopInputReading();
+    screen.program.hideCursor();
+    filesList.focus();
     screen.render();
   }
   
   function updateFocusStyles() {
-    if (focusIndex === 0) {
-      centerPane.style.border.fg = 'green';
-      chatLogBox.style.border.fg = 'blue';
-      chatInputBox.style.border.fg = 'grey';
-      chatInputBox.setLabel('{grey-fg} ✍️ Chat [/chat or Tab] {/grey-fg}');
-    } else {
-      centerPane.style.border.fg = 'grey';
-      chatLogBox.style.border.fg = 'green';
-      chatInputBox.style.border.fg = 'green';
-      chatInputBox.setLabel('{bold}{green-fg} ✍️ Chat [Enter: Send, /term: Exit] {/green-fg}{/bold}');
-    }
+    updateCenterLabel();
+
+    filesBox.style.border.fg = focusIndex === 2 ? 'green' : 'cyan';
+    filesBox.setLabel(' {bold}{cyan-fg}[FILES]{/cyan-fg}{/bold} {grey-fg}[F3]{/grey-fg} ');
+
+    chatLogBox.style.border.fg = focusIndex === 1 ? 'green' : 'blue';
+    chatInputBox.style.border.fg = focusIndex === 1 ? 'green' : 'cyan';
+    chatInputBox.setLabel(' {bold}{cyan-fg}[CHAT INPUT]{/cyan-fg}{/bold} {grey-fg}(/chat or Tab){/grey-fg} ');
+    chatInputPrompt.setContent(focusIndex === 1 ? '{149-fg}💬 >{/149-fg} ' : '{cyan-fg}💬 >{/cyan-fg} ');
+
     screen.render();
   }
 
+  function updateHardwareCursor() {
+    if (focusIndex === 2 || activeCenterTab === 'file') {
+      screen.program.hideCursor();
+      return;
+    }
+    if (focusIndex === 0) {
+      screen.program.showCursor();
+      const coords = terminalInput._getCoords();
+      if (coords) {
+        const y = coords.yi;
+        const inputVal = terminalInput.value || '';
+        const x = coords.xi + (blessed.unicode ? blessed.unicode.strWidth(inputVal) : inputVal.length);
+        screen.program.cursorPos(y, x);
+      }
+    } else if (focusIndex === 1) {
+      screen.program.showCursor();
+      const coords = chatInput._getCoords();
+      if (coords) {
+        const y = coords.yi;
+        const inputVal = chatInput.value || '';
+        const x = coords.xi + (blessed.unicode ? blessed.unicode.strWidth(inputVal) : inputVal.length);
+        screen.program.cursorPos(y, x);
+      }
+    }
+  }
+
+  screen.on('render', updateHardwareCursor);
+
   function switchFocus() {
+    // 0: Center Pane, 1: Team Chat, 2: Files
     if (focusIndex === 0) {
       focusChat();
+    } else if (focusIndex === 1) {
+      focusFiles();
     } else {
       focusTerminal();
     }
   }
 
-  screen.key(['tab', 'C-t'], () => {
-    switchFocus();
-  });
+  function cycleCenterTabs() {
+    if (activeCenterTab === 'term') showCenterTab('agy');
+    else if (activeCenterTab === 'agy') showCenterTab('codex');
+    else showCenterTab('term');
+  }
 
-  screen.key(['C-b'], () => {
-    toggleSidebar();
-  });
+  function resetFooter() {
+    footer.setContent(` {bold}{149-fg}[Tab]{/149-fg}{/bold} Focus │ {bold}{149-fg}[Ctrl+T]{/149-fg}{/bold} Tab │ {bold}{149-fg}[PgUp/Dn]{/149-fg}{/bold} Scroll │ {bold}{149-fg}[/]{/149-fg}{/bold} Cmds │ {bold}{149-fg}[/agy]{/149-fg}{/bold} AGY │ {bold}{cyan-fg}[/codex]{/cyan-fg}{/bold} Codex │ {bold}{yellow-fg}[/usage]{/yellow-fg}{/bold} Stats │ {bold}{yellow-fg}[F3]{/yellow-fg}{/bold} Files │ {bold}{yellow-fg}[Ctrl+O]{/yellow-fg}{/bold} Web │ {bold}{yellow-fg}[Ctrl+C]{/yellow-fg}{/bold} Quit `);
+  }
 
-  chatInputBox.on('click', focusChat);
-  chatLogBox.on('click', focusChat);
-  centerPane.on('click', focusTerminal);
-  terminalLog.on('click', focusTerminal);
+  function cleanActiveInput() {
+    process.nextTick(() => {
+      if (focusIndex !== 0) hideCommandPalette();
+      if (terminalInput && terminalInput.value) {
+        const cleaned = terminalInput.value.replace(/[\x00-\x08\x0b-\x1f\t]/g, '');
+        if (cleaned !== terminalInput.value) {
+          terminalInput.setValue(cleaned);
+          screen.render();
+        }
+      }
+      if (chatInput && chatInput.value) {
+        const cleaned = chatInput.value.replace(/[\x00-\x08\x0b-\x1f\t]/g, '');
+        if (cleaned !== chatInput.value) {
+          chatInput.setValue(cleaned);
+          screen.render();
+        }
+      }
+    });
+  }
 
-  screen.key(['escape'], () => {
-    // Escaping out of prompt is no longer needed
-  });
-
-  screen.key(['f5'], () => {
-    if (activeProc) return;
-    terminalLog.log(`{cyan-fg}SYSTEM>{/cyan-fg} Spawning automated demo...`);
+  function runDemo() {
+    const currentProc = getActiveProc();
+    if (currentProc) return;
+    getActiveLog().log(`{cyan-fg}SYSTEM>{/cyan-fg} Spawning automated demo...`);
     screen.render();
     const proc = spawn('node', [path.join(TURF_ROOT, 'demo', 'run-demo.js')], { shell: true, cwd: TURF_ROOT });
-    
+    if (activeCenterTab === 'codex') activeCodexProc = proc;
+    else if (activeCenterTab === 'agy') activeAgyProc = proc;
+    else activeTermProc = proc;
+    updateCenterLabel();
+
     proc.stdout.on('data', (data) => {
       const lines = data.toString().split('\n');
       lines.forEach(line => {
-        if (line) terminalLog.log(line.trimEnd());
+        if (line) getActiveLog().log(line.trimEnd());
       });
       screen.render();
     });
     proc.stderr.on('data', (data) => {
       const lines = data.toString().split('\n');
       lines.forEach(line => {
-        if (line) terminalLog.log(`{red-fg}${line.trimEnd()}{/red-fg}`);
+        if (line) getActiveLog().log(`{red-fg}${line.trimEnd()}{/red-fg}`);
       });
       screen.render();
     });
-  });
+    proc.on('close', () => {
+      if (activeCenterTab === 'codex') activeCodexProc = null;
+      else if (activeCenterTab === 'agy') activeAgyProc = null;
+      else activeTermProc = null;
+      updateCenterLabel();
+      screen.render();
+    });
+  }
 
-  screen.key(['o'], () => {
+  function openWebUI() {
     const url = `http://localhost:${port}/?room=${roomCode}&user=${encodeURIComponent(hostName)}`;
+    getActiveLog().log(`{cyan-fg}Opening Web UI:{/cyan-fg} {yellow-fg}${url}{/yellow-fg}`);
+    screen.render();
     if (process.platform === 'win32') {
       exec(`cmd.exe /c start "" "${url}"`);
     } else {
       exec(`cmd.exe /c start "" "${url}" 2>/dev/null || xdg-open "${url}" 2>/dev/null`);
     }
-  });
+  }
 
-  screen.key(['C-c'], () => {
-    if (activeProc) {
+  let lastCtrlCTime = 0;
+  let ctrlCTimer = null;
+
+  function handleCtrlC() {
+    const now = Date.now();
+    const currentProc = getActiveProc();
+
+    // If an active process is running, first Ctrl+C interrupts it
+    if (currentProc) {
       if (process.platform === 'win32') {
-        exec('taskkill /F /T /PID ' + activeProc.pid);
+        exec('taskkill /F /T /PID ' + currentProc.pid);
       } else {
         try {
-          process.kill(-activeProc.pid, 'SIGKILL');
+          process.kill(-currentProc.pid, 'SIGKILL');
         } catch (e) {
-          activeProc.kill('SIGKILL');
+          currentProc.kill('SIGKILL');
         }
       }
-      terminalLog.log(`{red-fg}^C (Interrupted){/red-fg}`);
-      activeProc = null;
-      promptPrefix.setContent(`{green-fg}${currentCli.prefix}>{/green-fg} `);
-      terminalInput.left = promptPrefix.content.replace(/{[^}]+}/g, '').length + 1;
+      getActiveLog().log(`{red-fg}^C (Interrupted process on ${activeCenterTab.toUpperCase()}){/red-fg}`);
+      if (activeCenterTab === 'codex') activeCodexProc = null;
+      else if (activeCenterTab === 'agy') activeAgyProc = null;
+      else activeTermProc = null;
+      lastCtrlCTime = 0;
+      updateCenterLabel();
       focusTerminal();
+      screen.render();
       return;
     }
+
+    // ponytail: real sessions live in ptyManager; legacy procs above are always null
+    if (ptyManager.isSessionActive(activeCenterTab)) {
+      ptyManager.killSession(activeCenterTab);
+      getActiveLog().log(`{red-fg}^C (Interrupted process on ${activeCenterTab.toUpperCase()}){/red-fg}`);
+      lastCtrlCTime = 0;
+      updateCenterLabel();
+      updateIntentBox();
+      focusTerminal();
+      screen.render();
+      return;
+    }
+
+    // Double Ctrl+C protection: require 2 presses within 2000ms to quit
+    if (lastCtrlCTime > 0 && (now - lastCtrlCTime) <= 2000) {
+      if (ctrlCTimer) clearTimeout(ctrlCTimer);
+      handleQuit();
+      return;
+    }
+
+    lastCtrlCTime = now;
+    getActiveLog().log(`{yellow-fg}Press Ctrl+C again within 2s to quit Turf.{/yellow-fg}`);
+    footer.setContent(` {bold}{red-bg}{white-fg} Press Ctrl+C again within 2s to QUIT Turf {/white-fg}{/red-bg}{/bold} `);
+    screen.render();
+
+    if (ctrlCTimer) clearTimeout(ctrlCTimer);
+    ctrlCTimer = setTimeout(() => {
+      lastCtrlCTime = 0;
+      resetFooter();
+      screen.render();
+    }, 2000);
+  }
+
+  function handleQuit() {
+    process.removeListener('uncaughtException', onUncaught);
+    process.removeListener('unhandledRejection', onUnhandled);
+    ptyManager.killAll();
+    const procs = [activeTermProc, activeAgyProc, activeCodexProc].filter(Boolean);
+    for (const proc of procs) {
+      if (process.platform === 'win32') {
+        exec('taskkill /F /T /PID ' + proc.pid);
+      } else {
+        try {
+          process.kill(-proc.pid, 'SIGKILL');
+        } catch (e) {
+          proc.kill('SIGKILL');
+        }
+      }
+    }
+    activeTermProc = null;
+    activeAgyProc = null;
+    activeCodexProc = null;
     
     if (wssInstance) {
       wssInstance.clients.forEach(c => c.close());
       wssInstance.close();
     }
     if (serverInstance) serverInstance.close();
+    try {
+      ws.close();
+    } catch (e) {}
     
-    screen.destroy();
+    screen.program.normalBuffer();
+    screen.program.showCursor();
+    try {
+      screen.destroy();
+    } catch (e) {}
+    process.stdout.write('\x1b[?1049l\x1b[?25h');
     process.exit(0);
+  }
+
+  // Raw global keypress interceptor (unblockable by textbox grabKeys)
+  screen.program.on('keypress', (ch, key) => {
+    if (!key) return;
+
+    // 0. Autocomplete Palette navigation & activation
+    if (!commandPaletteBox.hidden) {
+      if (key.name === 'up') {
+        commandPaletteBox.up();
+        screen.render();
+        return;
+      }
+      if (key.name === 'down') {
+        commandPaletteBox.down();
+        screen.render();
+        return;
+      }
+      if (key.name === 'tab' || ch === '\t') {
+        applySelectedPaletteCommand();
+        cleanActiveInput();
+        return;
+      }
+      if (key.name === 'escape' || ch === '\x1b') {
+        hideCommandPalette();
+        cleanActiveInput();
+        return;
+      }
+      if (key.name === 'enter' || key.name === 'return' || ch === '\r' || ch === '\n') {
+        const sel = paletteFilteredItems[commandPaletteBox.selected];
+        const val = (terminalInput.value || '').trim();
+        if (sel && val !== sel.cmd && !val.includes(' ')) {
+          if (['/model', '/effort', '/sandbox', '/resume', '/codex', '/agy', '/term', '/chat', '/file'].includes(sel.cmd)) {
+            terminalInput.setValue(sel.cmd + ' ');
+            hideCommandPalette();
+            focusTerminal();
+            cleanActiveInput();
+            screen.render();
+            return;
+          } else {
+            terminalInput.setValue(sel.cmd);
+            hideCommandPalette();
+          }
+        } else {
+          hideCommandPalette();
+        }
+      }
+    }
+
+    // 1. Double Ctrl+C protection
+    if ((key.ctrl && (key.name === 'c' || key.name === 'C')) || ch === '\x03') {
+      handleCtrlC();
+      cleanActiveInput();
+      return;
+    }
+
+    // 2. Ctrl+B: Toggle Left Sidebar
+    if ((key.ctrl && (key.name === 'b' || key.name === 'B')) || ch === '\x02') {
+      toggleSidebar();
+      cleanActiveInput();
+      return;
+    }
+
+    // 3. F2 or Ctrl+Q: Toggle Intent / Queue
+    if (key.name === 'f2' || (key.ctrl && (key.name === 'q' || key.name === 'Q')) || ch === '\x11') {
+      toggleRightSection();
+      cleanActiveInput();
+      return;
+    }
+
+    // 4. F3: Focus Files Explorer
+    if (key.name === 'f3') {
+      focusFiles();
+      cleanActiveInput();
+      return;
+    }
+
+    // 5. F4: Toggle Terminal / File Viewer tab
+    if (key.name === 'f4') {
+      toggleCenterTab();
+      cleanActiveInput();
+      return;
+    }
+
+    // 6. Tab: Switch Pane Focus (Center Pane -> Team Chat -> Files -> Center Pane)
+    if (key.name === 'tab' || ch === '\t') {
+      switchFocus();
+      cleanActiveInput();
+      return;
+    }
+
+    // 6b. Ctrl+T: Cycle Center Tabs (TERM -> AGY -> CODEX -> TERM)
+    if ((key.ctrl && (key.name === 't' || key.name === 'T')) || ch === '\x14') {
+      cycleCenterTabs();
+      cleanActiveInput();
+      return;
+    }
+
+    // 7. Escape: Return to Terminal tab or focus Terminal
+    if (key.name === 'escape' || ch === '\x1b') {
+      if (activeCenterTab === 'file') {
+        showTerminalTab();
+        return;
+      }
+      if (focusIndex !== 0) {
+        focusTerminal();
+        return;
+      }
+    }
+
+    // 8. F5: Run automated demo
+    if (key.name === 'f5') {
+      runDemo();
+      cleanActiveInput();
+      return;
+    }
+
+    // 9. Ctrl+O: Open Web UI
+    if ((key.ctrl && (key.name === 'o' || key.name === 'O')) || ch === '\x0f') {
+      openWebUI();
+      cleanActiveInput();
+      return;
+    }
+
+    // 10. Unblockable navigation when FILES list is focused
+    const isFilesFocus = focusIndex === 2;
+    if (isFilesFocus) {
+      if (key.name === 'down' || (!key.ctrl && (key.name === 'j' || ch === 'j'))) {
+        filesList.down();
+        screen.render();
+        return;
+      }
+      if (key.name === 'up' || (!key.ctrl && (key.name === 'k' || ch === 'k'))) {
+        filesList.up();
+        screen.render();
+        return;
+      }
+      if (key.name === 'enter' || key.name === 'return' || ch === '\r' || ch === '\n') {
+        handleFileActivation();
+        return;
+      }
+      if (key.name === 'space' || ch === ' ') {
+        handleFileActivation();
+        return;
+      }
+      if (key.name === 'left' || (!key.ctrl && (key.name === 'h' || ch === 'h'))) {
+        handleFileLeftKey();
+        return;
+      }
+      if (key.name === 'right' || (!key.ctrl && (key.name === 'l' || ch === 'l'))) {
+        handleFileRightKey();
+        return;
+      }
+      if (key.name === 'pageup') {
+        filesList.move(-Math.max(1, (filesList.height || 10) - 2));
+        screen.render();
+        return;
+      }
+      if (key.name === 'pagedown') {
+        filesList.move(Math.max(1, (filesList.height || 10) - 2));
+        screen.render();
+        return;
+      }
+      if (key.name === 'home') {
+        filesList.select(0);
+        screen.render();
+        return;
+      }
+      if (key.name === 'end') {
+        filesList.select(Math.max(0, visibleFileList.length - 1));
+        screen.render();
+        return;
+      }
+    }
+
+    // 11. Center Pane & Team Chat scrolling with keyboard
+    if (!isFilesFocus) {
+      const isPageUp = key.name === 'pageup' || ch === '\x1b[5~';
+      const isPageDown = key.name === 'pagedown' || ch === '\x1b[6~';
+      const isUpScroll = (key.shift && key.name === 'up') || (key.ctrl && key.name === 'up') || (key.ctrl && (key.name === 'y' || ch === '\x19')) || (focusIndex === 0 && key.name === 'up' && !(terminalInput.value || '').trim());
+      const isDownScroll = (key.shift && key.name === 'down') || (key.ctrl && key.name === 'down') || (key.ctrl && (key.name === 'e' || ch === '\x05')) || (focusIndex === 0 && key.name === 'down' && !(terminalInput.value || '').trim());
+      const isHome = (key.shift && key.name === 'home');
+      const isEnd = (key.shift && key.name === 'end');
+
+      if (isPageUp) {
+        const h = focusIndex === 1 ? (chatLogBox.height || 10) : ((getActiveLog() && getActiveLog().height) || 10);
+        scrollActiveLog(-Math.max(1, Math.floor(h / 2)));
+        return;
+      }
+      if (isPageDown) {
+        const h = focusIndex === 1 ? (chatLogBox.height || 10) : ((getActiveLog() && getActiveLog().height) || 10);
+        scrollActiveLog(Math.max(1, Math.floor(h / 2)));
+        return;
+      }
+      if (isUpScroll) {
+        scrollActiveLog(-3);
+        return;
+      }
+      if (isDownScroll) {
+        scrollActiveLog(3);
+        return;
+      }
+      if (isHome) {
+        const log = getActiveLog();
+        if (log && typeof log.setScrollPerc === 'function') {
+          log.setScrollPerc(0);
+          screen.render();
+          return;
+        }
+      }
+      if (isEnd) {
+        const log = getActiveLog();
+        if (log && typeof log.setScrollPerc === 'function') {
+          log.setScrollPerc(100);
+          screen.render();
+          return;
+        }
+      }
+    }
+
+    if (focusIndex === 0) {
+      process.nextTick(() => {
+        updatePaletteFromInput();
+      });
+    }
   });
 
+  function scrollActiveLog(delta) {
+    if (focusIndex === 1) {
+      if (chatLogBox && typeof chatLogBox.scroll === 'function') {
+        chatLogBox.scroll(delta);
+        screen.render();
+      }
+    } else {
+      const activeLog = getActiveLog();
+      if (activeLog && typeof activeLog.scroll === 'function') {
+        activeLog.scroll(delta);
+        screen.render();
+      }
+    }
+  }
+
+  // Mouse click handlers
+  chatInputBox.on('click', focusChat);
+  chatLogBox.on('click', focusChat);
+  centerPane.on('click', () => focusTerminal());
+  termLog.on('click', () => showCenterTab('term'));
+  agyLog.on('click', () => showCenterTab('agy'));
+  codexLog.on('click', () => showCenterTab('codex'));
+  fileViewerLog.on('click', () => focusTerminal());
+  filesBox.on('click', focusFiles);
+  filesList.on('click', focusFiles);
+
+  // Global screen mouse wheel listeners
+  screen.on('wheelup', () => scrollActiveLog(-3));
+  screen.on('wheeldown', () => scrollActiveLog(3));
+
+  // Element mouse wheel scrolling
+  [centerPane, termLog, agyLog, codexLog, fileViewerLog].forEach(box => {
+    try { screen.enableMouse(box); } catch (e) {}
+    box.on('wheelup', () => scrollActiveLog(-3));
+    box.on('wheeldown', () => scrollActiveLog(3));
+  });
+
+  try { screen.enableMouse(chatLogBox); } catch (e) {}
+  chatLogBox.on('wheelup', () => {
+    chatLogBox.scroll(-3);
+    screen.render();
+  });
+  chatLogBox.on('wheeldown', () => {
+    chatLogBox.scroll(3);
+    screen.render();
+  });
+
+  function executePromptForAgent(agent, inputStr) {
+    const targetLog = agent === 'codex' ? codexLog : agyLog;
+    const prefixTag = agent === 'codex' ? '{bold}{cyan-fg}CODEX>{/cyan-fg}{/bold}' : '{bold}{149-fg}AGY>{/149-fg}{/bold}';
+    targetLog.log(`${prefixTag} {yellow-fg}${inputStr}{/yellow-fg}`);
+
+    const config = ptyManager.getAgentConfig(agent);
+    if (config.sessionId || config.turnCount > 0) {
+      targetLog.log(`{grey-fg}⚡ [Continuing Turn #${config.turnCount + 1}...]{/grey-fg}`);
+    } else if (agent === 'agy') {
+      targetLog.log(`{grey-fg}⚡ [Initializing Antigravity runtime & MCP servers (takes ~15s on first boot)...]{/grey-fg}`);
+    } else {
+      targetLog.log(`{grey-fg}⚡ [Starting Codex session (${config.model || 'default'} | ${config.sandbox})...]{/grey-fg}`);
+    }
+
+    try {
+      ptyManager.spawnSession(agent, inputStr, { cwd: currentDir });
+    } catch (err) {
+      targetLog.log(`{red-fg}Error starting ${agent.toUpperCase()}: ${err.message}{/red-fg}`);
+    }
+  }
+
   terminalInput.on('submit', (value) => {
+    hideCommandPalette();
     const inputStr = value.trim();
-    if (!inputStr && !activeProc) {
+    const isRunning = ptyManager.isSessionActive(activeCenterTab);
+    const currentLog = getActiveLog();
+
+    if (!inputStr && !isRunning) {
       terminalInput.clearValue();
       focusTerminal();
       return;
     }
 
     if (inputStr === '/kill' || inputStr === '/stop') {
-      if (activeProc) {
-        if (process.platform === 'win32') {
-          exec('taskkill /F /T /PID ' + activeProc.pid);
-        } else {
-          try {
-            process.kill(-activeProc.pid, 'SIGKILL');
-          } catch (e) {
-            activeProc.kill('SIGKILL');
-          }
-        }
-        terminalLog.log(`{red-fg}Process killed manually.{/red-fg}`);
-        activeProc = null;
+      if (isRunning) {
+        ptyManager.killSession(activeCenterTab);
+        currentLog.log(`{red-fg}Session terminated on ${activeCenterTab.toUpperCase()}.{/red-fg}`);
+        updateCenterLabel();
+        updateIntentBox();
       } else {
-        terminalLog.log(`{grey-fg}No active process to kill.{/grey-fg}`);
+        currentLog.log(`{grey-fg}No active process to kill on ${activeCenterTab.toUpperCase()}.{/grey-fg}`);
       }
       terminalInput.clearValue();
       focusTerminal();
       return;
     }
 
-    if (activeProc) {
-      activeProc.stdin.write(inputStr + '\n');
-      terminalLog.log(`{white-fg}> ${inputStr}{/white-fg}`);
+    if (isRunning) {
+      ptyManager.write(activeCenterTab, inputStr + '\r\n');
+      currentLog.log(`{bold}{grey-fg}> ${inputStr}{/grey-fg}{/bold}`);
       terminalInput.clearValue();
       focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/usage' || inputStr === '/stats') {
+      const stats = ptyManager.getUsageStats(activeCenterTab);
+      currentLog.log(`{bold}{149-fg}┌─ AGENT USAGE & CONFIG [${activeCenterTab.toUpperCase()}] ────────────────────────┐{/149-fg}{/bold}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Session ID:{/grey-fg}  {yellow-fg}${stats.sessionId}{/yellow-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Active Model:{/grey-fg} {white-fg}${stats.model}{/white-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Reasoning:{/grey-fg}   {white-fg}${stats.effort}{/white-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Sandbox:{/grey-fg}     {cyan-fg}${stats.sandbox}{/cyan-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Turns Used:{/grey-fg}  {green-fg}${stats.turnCount}{/green-fg}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {grey-fg}Tokens Used:{/grey-fg} {magenta-fg}${stats.totalTokens.toLocaleString()}{/magenta-fg}`);
+      currentLog.log(`{bold}{149-fg}└────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/model' || inputStr.startsWith('/model ')) {
+      const newModel = inputStr.replace(/^\/model\s*/, '').trim();
+      if (newModel) {
+        ptyManager.setModel(activeCenterTab, newModel);
+        currentLog.log(`{green-fg}✔ Active model for ${activeCenterTab.toUpperCase()} set to:{/green-fg} {bold}${newModel}{/bold}`);
+      } else {
+        const curModel = ptyManager.getModel(activeCenterTab);
+        currentLog.log(`{bold}{149-fg}Active model for ${activeCenterTab.toUpperCase()}:{/149-fg}{/bold} {yellow-fg}${curModel}{/yellow-fg}`);
+        if (activeCenterTab === 'agy') {
+          currentLog.log(`{cyan-fg}Available Antigravity models:{/cyan-fg}`);
+          currentLog.log(`  • {yellow-fg}gemini-3.8-flash-high{/yellow-fg} {white-fg}(Fastest / Recommended Default){/white-fg}`);
+          currentLog.log(`  • {yellow-fg}gemini-3.8-flash-medium{/yellow-fg} │ {yellow-fg}gemini-3.8-flash-low{/yellow-fg}`);
+          currentLog.log(`  • {yellow-fg}gemini-3.7-flash-high{/yellow-fg}   │ {yellow-fg}gemini-3.7-flash-medium{/yellow-fg}`);
+          currentLog.log(`  • {yellow-fg}gemini-3.6-flash-high{/yellow-fg}   │ {yellow-fg}gemini-3.1-pro-high{/yellow-fg}`);
+          currentLog.log(`  • {yellow-fg}claude-sonnet-4-6{/yellow-fg}       │ {yellow-fg}claude-opus-4-6-thinking{/yellow-fg}`);
+          currentLog.log(`  • {yellow-fg}gpt-oss-120b-medium{/yellow-fg}`);
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model gemini-3.8-flash-high){/white-fg}`);
+        } else if (activeCenterTab === 'codex') {
+          currentLog.log(`{cyan-fg}Common Codex models:{/cyan-fg} o3-mini, gpt-4o, o1`);
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model o3-mini){/white-fg}`);
+        }
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/effort' || inputStr.startsWith('/effort ')) {
+      const newEffort = inputStr.replace(/^\/effort\s*/, '').trim().toLowerCase();
+      if (['low', 'medium', 'high'].includes(newEffort)) {
+        ptyManager.setEffort(activeCenterTab, newEffort);
+        currentLog.log(`{green-fg}✔ Reasoning effort for ${activeCenterTab.toUpperCase()} set to:{/green-fg} {bold}${newEffort}{/bold}`);
+      } else {
+        const curEffort = ptyManager.getEffort(activeCenterTab);
+        currentLog.log(`{grey-fg}Reasoning effort for ${activeCenterTab.toUpperCase()}:{/grey-fg} {bold}${curEffort}{/bold} {grey-fg}(Usage: /effort low|medium|high){/grey-fg}`);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/sandbox' || inputStr.startsWith('/sandbox ')) {
+      const newMode = inputStr.replace(/^\/sandbox\s*/, '').trim();
+      if (newMode) {
+        ptyManager.setSandbox(activeCenterTab, newMode);
+        currentLog.log(`{green-fg}✔ Sandbox mode for ${activeCenterTab.toUpperCase()} set to:{/green-fg} {bold}${newMode}{/bold}`);
+      } else {
+        const curMode = ptyManager.getSandbox(activeCenterTab);
+        currentLog.log(`{grey-fg}Sandbox mode for ${activeCenterTab.toUpperCase()}:{/grey-fg} {bold}${curMode}{/bold} {grey-fg}(Usage: /sandbox workspace-write | read-only){/grey-fg}`);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/new' || inputStr === '/reset') {
+      ptyManager.resetSession(activeCenterTab);
+      currentLog.log(`{green-fg}✔ Session memory reset for ${activeCenterTab.toUpperCase()}. Next prompt starts a fresh session.{/green-fg}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/resume' || inputStr.startsWith('/resume ')) {
+      const resumeId = inputStr.replace(/^\/resume\s*/, '').trim();
+      if (resumeId) {
+        ptyManager.resumeSession(activeCenterTab, resumeId);
+        currentLog.log(`{green-fg}✔ Active session for ${activeCenterTab.toUpperCase()} set to resume ID:{/green-fg} {bold}${resumeId}{/bold}`);
+      } else {
+        const stats = ptyManager.getUsageStats(activeCenterTab);
+        currentLog.log(`{grey-fg}Current session ID for ${activeCenterTab.toUpperCase()}:{/grey-fg} {yellow-fg}${stats.sessionId}{/yellow-fg} {grey-fg}(Usage: /resume <session-id>){/grey-fg}`);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/diff' || inputStr.startsWith('/diff ')) {
+      try {
+        const diffStat = execSync('git diff --stat', { cwd: currentDir, encoding: 'utf8', timeout: 5000 }).trim();
+        const statusStat = execSync('git status -s', { cwd: currentDir, encoding: 'utf8', timeout: 5000 }).trim();
+        if (!diffStat && !statusStat) {
+          currentLog.log(`{green-fg}✔ Clean working directory. No uncommitted modifications.{/green-fg}`);
+        } else {
+          currentLog.log(`{bold}{149-fg}┌─ WORKSPACE MODIFICATIONS (GIT DIFF) ────────────┐{/149-fg}{/bold}`);
+          if (statusStat) {
+            statusStat.split('\n').forEach(line => currentLog.log(`{yellow-fg}${line}{/yellow-fg}`));
+          }
+          if (diffStat) {
+            currentLog.log(`{grey-fg}───────────────────────────────────────────────────{/grey-fg}`);
+            diffStat.split('\n').forEach(line => currentLog.log(`{cyan-fg}${line}{/cyan-fg}`));
+          }
+          currentLog.log(`{bold}{149-fg}└───────────────────────────────────────────────────┘{/149-fg}{/bold}`);
+        }
+      } catch (err) {
+        currentLog.log(`{red-fg}Failed to get git diff: ${err.message}{/red-fg}`);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/help' || inputStr === '/h' || inputStr === '?') {
+      currentLog.log(`{bold}{149-fg}┌─ TURF CODE COMMAND CHEAT SHEET ──────────────────────────┐{/149-fg}{/bold}`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/usage, /stats{/bold}       View turns, tokens & active session config`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/model <name>{/bold}        Set model (e.g. gpt-4o, claude-3-7-sonnet)`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/effort <lvl>{/bold}        Set reasoning effort: low | medium | high`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sandbox <mode>{/bold}     Set sandbox: workspace-write | read-only`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/new, /reset{/bold}         Clear session memory & start fresh`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/resume <id>{/bold}        Resume specific past session ID`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/diff{/bold}                Inspect git diff of modifications made`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/kill, /stop{/bold}         Stop running process or agent immediately`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/codex, /agy, /term{/bold}  Switch active tab or run targeted command`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/chat <msg>{/bold}          Send team chat message or focus chat`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
+      currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/codex' || inputStr.startsWith('/codex ')) {
+      const prompt = inputStr.replace(/^\/codex\s*/, '').trim();
+      showCenterTab('codex');
+      terminalInput.clearValue();
+      if (prompt) {
+        executePromptForAgent('codex', prompt);
+      }
+      return;
+    }
+
+    if (inputStr === '/agy' || inputStr.startsWith('/agy ')) {
+      const prompt = inputStr.replace(/^\/agy\s*/, '').trim();
+      showCenterTab('agy');
+      terminalInput.clearValue();
+      if (prompt) {
+        executePromptForAgent('agy', prompt);
+      }
+      return;
+    }
+
+    if (inputStr === '/term' || inputStr === '/shell' || inputStr.startsWith('/term ') || inputStr.startsWith('/shell ')) {
+      const cmd = inputStr.replace(/^(\/term|\/shell)\s*/, '').trim();
+      showCenterTab('term');
+      terminalInput.clearValue();
+      if (cmd) {
+        termLog.log(`{bold}{149-fg}>{/149-fg}{/bold} {yellow-fg}${cmd}{/yellow-fg}`);
+        spawnTerminalProcess(cmd, 'term');
+      }
       return;
     }
 
@@ -443,105 +1968,122 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       const msg = inputStr.replace(/^(\/chat|\/c|chat)\s*/, '').trim();
       if (msg) {
         ws.send(JSON.stringify({ type: 'chat:send', user: hostName, message: msg }));
-        terminalLog.log(`{cyan-fg}[Chat Sent]:{/cyan-fg} ${msg}`);
+        currentLog.log(`{cyan-fg}[Chat Sent]:{/cyan-fg} ${msg}`);
       } else {
-        terminalLog.log('{cyan-fg}Switched to Team Chat. Type your message below.{/cyan-fg}');
+        currentLog.log('{cyan-fg}Focused Team Chat. Type your message below. (Type /term or Esc to return).{/cyan-fg}');
+        focusChat();
       }
-      focusChat();
       terminalInput.clearValue();
       return;
     }
 
-    if (inputStr.startsWith('/term') || inputStr.startsWith('/t ') || inputStr === '/t' || inputStr === 'term') {
-      terminalInput.clearValue();
-      terminalLog.log('{cyan-fg}ℹ️ You are in the Terminal pane. (Type /chat to switch).{/cyan-fg}');
-      focusTerminal();
-      return;
-    }
-    
     if (inputStr === 'cls' || inputStr === 'clear') {
-      terminalLog.setContent('');
+      currentLog.setContent('');
       printWelcomeBanner();
       terminalInput.clearValue();
       focusTerminal();
       return;
     }
-    
-    if (inputStr.startsWith('cd ')) {
-      const target = inputStr.substring(3).trim();
-      currentDir = path.resolve(currentDir, target);
-      centerPane.setLabel(`{bold} TERMINAL {/bold}│ {yellow-fg}${currentDir}{/yellow-fg}`);
-      terminalLog.log(`{cyan-fg}Directory changed to:{/cyan-fg} {yellow-fg}${currentDir}{/yellow-fg}`);
+
+    if (inputStr.startsWith('/file ') || inputStr.startsWith('/view ') || inputStr.startsWith('view ')) {
+      const targetFile = inputStr.replace(/^(\/file|\/view|view)\s+/, '').trim();
+      if (targetFile) {
+        openFileInViewer(targetFile);
+        terminalInput.clearValue();
+        return;
+      }
+    }
+
+    if (inputStr === '/sidebar' || inputStr === '/b') {
+      toggleSidebar();
       terminalInput.clearValue();
       focusTerminal();
       return;
     }
-    
-    terminalLog.log(`{green-fg}${promptStr}{/green-fg} {yellow-fg}${inputStr}{/yellow-fg}`);
-    
-    let execCmd = inputStr;
-    const isKnownShellCmd = /^(dir|ls|git|npm|cd|cls|node|python|py)\s/i.test(inputStr + ' ') || inputStr.startsWith('!');
 
-    if (inputStr.startsWith('agy "') || inputStr.startsWith('agy <')) {
-      const prompt = inputStr.substring(4).replace(/^["<]|[">]$/g, '').trim();
-      execCmd = `agy -p "${prompt}" --dangerously-skip-permissions`;
-    } else if (inputStr.startsWith('claude "') || inputStr.startsWith('claude <')) {
-      const prompt = inputStr.substring(7).replace(/^["<]|[">]$/g, '').trim();
-      execCmd = `claude -p "${prompt}" --dangerously-skip-permissions`;
-    } else if (inputStr.startsWith('codex "') || inputStr.startsWith('codex <')) {
-      const prompt = inputStr.substring(6).replace(/^["<]|[">]$/g, '').trim();
-      execCmd = `codex exec "${prompt}"`;
-    } else if (currentCli.id !== 'shell' && !isKnownShellCmd) {
-      if (currentCli.id === 'agy') execCmd = `agy -p "${inputStr}" --dangerously-skip-permissions`;
-      else if (currentCli.id === 'claude') execCmd = `claude -p "${inputStr}" --dangerously-skip-permissions`;
-      else if (currentCli.id === 'codex') execCmd = `codex exec "${inputStr}"`;
-      else if (currentCli.id === 'opencode') execCmd = `opencode "${inputStr}"`;
-    } else if (inputStr.startsWith('!')) {
-      execCmd = inputStr.substring(1).trim();
+    if (inputStr === '/queue' || inputStr === '/intent' || inputStr === '/q' || inputStr === '/i') {
+      toggleRightSection();
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
     }
-    
+
+    if (inputStr === '/files' || inputStr === '/f') {
+      focusFiles();
+      terminalInput.clearValue();
+      return;
+    }
+
+    if (inputStr === '/demo') {
+      runDemo();
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/web' || inputStr === '/browser' || inputStr === '/o') {
+      openWebUI();
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/exit' || inputStr === '/quit') {
+      handleQuit();
+      return;
+    }
+
+    if (inputStr.startsWith('cd ')) {
+      const target = inputStr.substring(3).trim();
+      currentDir = path.resolve(currentDir, target);
+      isTreeInitialized = false;
+      updateHeader();
+      updateCenterLabel();
+      currentLog.log(`{cyan-fg}Directory changed to:{/cyan-fg} {yellow-fg}${currentDir}{/yellow-fg}`);
+      refreshFileList(false);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
     terminalInput.clearValue();
-    spawnTerminalProcess(execCmd);
+
+    if (activeCenterTab === 'codex') {
+      const isKnownShellCmd = /^(dir|ls|git|npm|cd|cls|node|python|py)\s/i.test(inputStr + ' ') || inputStr.startsWith('!');
+      if (isKnownShellCmd) {
+        const cmd = inputStr.startsWith('!') ? inputStr.slice(1).trim() : inputStr;
+        currentLog.log(`{bold}{cyan-fg}CODEX [CMD]>{/cyan-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
+        spawnTerminalProcess(cmd, 'codex');
+      } else {
+        executePromptForAgent('codex', inputStr);
+      }
+    } else if (activeCenterTab === 'agy') {
+      const isKnownShellCmd = /^(dir|ls|git|npm|cd|cls|node|python|py)\s/i.test(inputStr + ' ') || inputStr.startsWith('!');
+      if (isKnownShellCmd) {
+        const cmd = inputStr.startsWith('!') ? inputStr.slice(1).trim() : inputStr;
+        currentLog.log(`{bold}{149-fg}AGY [CMD]>{/149-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
+        spawnTerminalProcess(cmd, 'agy');
+      } else {
+        executePromptForAgent('agy', inputStr);
+      }
+    } else {
+      // term tab
+      currentLog.log(`{bold}{149-fg}>{/149-fg}{/bold} {yellow-fg}${inputStr}{/yellow-fg}`);
+      const cmd = inputStr.startsWith('!') ? inputStr.slice(1).trim() : inputStr;
+      spawnTerminalProcess(cmd, 'term');
+    }
   });
 
-  function spawnTerminalProcess(cmdStr) {
-    const isWin = process.platform === 'win32';
-    const shellExe = isWin ? 'powershell.exe' : (process.env.SHELL || 'bash');
-    const shellArgs = isWin ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', cmdStr] : ['-c', cmdStr];
-    const env = {
-      ...process.env,
-      CLOUD_CODE_URL: 'https://cloudcode-pa.googleapis.com',
-      CLOUD_ENV: 'CLOUD_ENVIRONMENT_PROD'
-    };
-    
-    activeProc = spawn(shellExe, shellArgs, { cwd: currentDir, env, detached: !isWin });
-    
-    activeProc.stdout.on('data', (data) => {
-      const lines = data.toString().split('\n');
-      lines.forEach(line => {
-        if (line) terminalLog.log(line.trimEnd());
-      });
-      screen.render();
-    });
-    
-    activeProc.stderr.on('data', (data) => {
-      const lines = data.toString().split('\n');
-      lines.forEach(line => {
-        if (line) terminalLog.log(`{red-fg}${line.trimEnd()}{/red-fg}`);
-      });
-      screen.render();
-    });
-    
-    activeProc.on('close', (code) => {
-      if (code !== 0 && code !== null) {
-        terminalLog.log(`{grey-fg}Process exited with code ${code}{/grey-fg}`);
-      }
-      activeProc = null;
-      promptPrefix.setContent(`{green-fg}${currentCli.prefix}>{/green-fg} `);
-      terminalInput.left = promptPrefix.content.replace(/{[^}]+}/g, '').length + 1;
+  function spawnTerminalProcess(cmdStr, targetTab = activeCenterTab) {
+    const targetLog = targetTab === 'codex' ? codexLog : (targetTab === 'agy' ? agyLog : termLog);
+    try {
+      ptyManager.spawnSession(targetTab, cmdStr, { cwd: currentDir });
+    } catch (err) {
+      targetLog.log(`{red-fg}Execution error: ${err.message}{/red-fg}`);
+    }
+    if (activeCenterTab === targetTab) {
       focusTerminal();
-    });
-    focusTerminal();
+    }
   }
 
   chatInput.on('submit', (value) => {
