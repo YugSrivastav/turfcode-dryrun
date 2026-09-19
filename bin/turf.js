@@ -308,9 +308,13 @@ const TURF_KEY_MARKER = path.join(os.homedir(), '.turf', 'key-setup-done');
 
 function hasAnyConfiguredKey(destDir) {
   const envFile = path.join(destDir || process.cwd(), '.env');
+  const globalEnv = path.join(os.homedir(), '.turf', '.env');
   let envContent = '';
   try {
-    if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+    if (fs.existsSync(envFile)) envContent += fs.readFileSync(envFile, 'utf8') + '\n';
+  } catch {}
+  try {
+    if (fs.existsSync(globalEnv)) envContent += fs.readFileSync(globalEnv, 'utf8') + '\n';
   } catch {}
   return TURF_PROVIDERS.some((p) => (process.env[p.env] && process.env[p.env].trim()) || new RegExp(`^${p.env}=.+`, 'm').test(envContent));
 }
@@ -326,11 +330,44 @@ function markKeySetupDone() {
   } catch {}
 }
 
+function writeKeyToEnv(targetFile, envVar, keyVal) {
+  try {
+    fs.mkdirSync(path.dirname(targetFile), { recursive: true });
+    let content = fs.existsSync(targetFile) ? fs.readFileSync(targetFile, 'utf8') : '';
+    if (!content.endsWith('\n') && content.length > 0) content += '\n';
+
+    if (envVar === 'GROQ_API_KEY') {
+      const existingGroq = process.env.GROQ_API_KEY;
+      if (existingGroq && existingGroq !== keyVal) {
+        let keysList = process.env.GROQ_API_KEYS ? process.env.GROQ_API_KEYS.split(',').map(k => k.trim()).filter(Boolean) : [existingGroq];
+        if (!keysList.includes(keyVal)) keysList.push(keyVal);
+        const keysStr = keysList.join(',');
+        process.env.GROQ_API_KEYS = keysStr;
+        const multiRe = /^GROQ_API_KEYS=.*$/m;
+        content = multiRe.test(content)
+          ? content.replace(multiRe, `GROQ_API_KEYS=${keysStr}`)
+          : content + `GROQ_API_KEYS=${keysStr}\n`;
+      }
+    }
+
+    const lineRe = new RegExp(`^${envVar}=.*$`, 'm');
+    content = lineRe.test(content)
+      ? content.replace(lineRe, `${envVar}=${keyVal}`)
+      : content + `${envVar}=${keyVal}\n`;
+
+    fs.writeFileSync(targetFile, content, 'utf8');
+  } catch (err) {}
+}
+
 async function setupTurfApiKey(promptFn, pad, destDir, force = false) {
   const envFile = path.join(destDir || process.cwd(), '.env');
+  const globalEnv = path.join(os.homedir(), '.turf', '.env');
   let envContent = '';
   try {
-    if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+    if (fs.existsSync(envFile)) envContent += fs.readFileSync(envFile, 'utf8') + '\n';
+  } catch {}
+  try {
+    if (fs.existsSync(globalEnv)) envContent += fs.readFileSync(globalEnv, 'utf8') + '\n';
   } catch {}
 
   const hasKey = hasAnyConfiguredKey(destDir);
@@ -345,8 +382,12 @@ async function setupTurfApiKey(promptFn, pad, destDir, force = false) {
   const finish = (res) => { markKeySetupDone(); return res; };
 
   while (true) {
+    envContent = '';
     try {
-      if (fs.existsSync(envFile)) envContent = fs.readFileSync(envFile, 'utf8');
+      if (fs.existsSync(envFile)) envContent += fs.readFileSync(envFile, 'utf8') + '\n';
+    } catch {}
+    try {
+      if (fs.existsSync(globalEnv)) envContent += fs.readFileSync(globalEnv, 'utf8') + '\n';
     } catch {}
 
     console.log('\n' + pad + bright('Turf agent LLM key') + ' ' + dim('(BYOK — saved to .env, never git)'));
@@ -373,30 +414,9 @@ async function setupTurfApiKey(promptFn, pad, destDir, force = false) {
     process.env[provider.env] = trimmedKey;
 
     try {
-      let content = fs.existsSync(envFile) ? fs.readFileSync(envFile, 'utf8') : '';
-      if (!content.endsWith('\n') && content.length > 0) content += '\n';
-
-      if (provider.env === 'GROQ_API_KEY') {
-        const existingGroq = process.env.GROQ_API_KEY;
-        if (existingGroq && existingGroq !== trimmedKey) {
-          let keysList = process.env.GROQ_API_KEYS ? process.env.GROQ_API_KEYS.split(',').map(k => k.trim()).filter(Boolean) : [existingGroq];
-          if (!keysList.includes(trimmedKey)) keysList.push(trimmedKey);
-          const keysStr = keysList.join(',');
-          process.env.GROQ_API_KEYS = keysStr;
-          const multiRe = /^GROQ_API_KEYS=.*$/m;
-          content = multiRe.test(content)
-            ? content.replace(multiRe, `GROQ_API_KEYS=${keysStr}`)
-            : content + `GROQ_API_KEYS=${keysStr}\n`;
-        }
-      }
-
-      const lineRe = new RegExp(`^${provider.env}=.*$`, 'm');
-      content = lineRe.test(content)
-        ? content.replace(lineRe, `${provider.env}=${trimmedKey}`)
-        : content + `${provider.env}=${trimmedKey}\n`;
-
-      fs.writeFileSync(envFile, content, 'utf8');
-      console.log(pad + accent('●') + ' ' + dim(`Saved ${provider.env} to ${envFile}`));
+      writeKeyToEnv(envFile, provider.env, trimmedKey);
+      writeKeyToEnv(globalEnv, provider.env, trimmedKey);
+      console.log(pad + accent('●') + ' ' + dim(`Saved ${provider.env} to .env and global ~/.turf/.env`));
     } catch (err) {
       console.log(pad + dim(`(session-only: could not write .env — ${err.message})`));
     }

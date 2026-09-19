@@ -9,10 +9,15 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import os from 'os';
 import dotenv from 'dotenv';
 import { getNextGroqApiKey } from '../server/model_discovery.js';
 
 dotenv.config();
+const globalEnv = path.join(os.homedir(), '.turf', '.env');
+if (fs.existsSync(globalEnv)) {
+  dotenv.config({ path: globalEnv, override: true });
+}
 if (fs.existsSync(path.join(process.cwd(), '.env'))) {
   dotenv.config({ path: path.join(process.cwd(), '.env'), override: true });
 }
@@ -44,7 +49,7 @@ if (fs.existsSync(EXT) && !args.includes('--no-extensions')) args.push('-e', EXT
 
 // Optimize token usage on free tiers by avoiding unnecessary reasoning bloat
 if (!args.includes('--thinking') && !args.some(a => a.startsWith('--thinking='))) {
-  args.push('--thinking', 'none');
+  args.push('--thinking', 'off');
 }
 
 const res = spawnSync(process.execPath, [PI_CLI, ...args], { stdio: 'inherit', env });

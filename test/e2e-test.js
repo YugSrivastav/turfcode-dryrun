@@ -690,8 +690,8 @@ async function runTests() {
   const origGemini = process.env.GEMINI_API_KEY;
   process.env.GEMINI_API_KEY = 'test-gemini-key';
   const turfModelsWithGemini = await getTurfModels(process.cwd());
-  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-flash'), 'getTurfModels includes gemini-2.5-flash when GEMINI_API_KEY exists');
-  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-pro'), 'getTurfModels includes gemini-2.5-pro when GEMINI_API_KEY exists');
+  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.0-flash'), 'getTurfModels includes gemini-2.0-flash when GEMINI_API_KEY exists');
+  assert(turfModelsWithGemini.some(m => m.id === 'gemini-1.5-pro'), 'getTurfModels includes gemini-1.5-pro when GEMINI_API_KEY exists');
   if (origGemini) process.env.GEMINI_API_KEY = origGemini; else delete process.env.GEMINI_API_KEY;
 
   // 6. Blessed textbox prototype listener crash guard

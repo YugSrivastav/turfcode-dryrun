@@ -40,7 +40,7 @@ export function spawnAgent(agentType, envOptions, onData, onExit) {
             kill: () => ptyProcess.kill()
         };
     } else {
-        const cp = spawn(cmd, [], {
+        const cp = spawn(cmd, {
             shell: true,
             cwd: envOptions.cwd || process.cwd(),
             env: env

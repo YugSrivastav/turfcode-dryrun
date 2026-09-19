@@ -965,8 +965,9 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         { cmd: '/model Qwen/Qwen3.8-27B', desc: 'Qwen 3.8 27B (Open-weight coder)' }
       ];
       const fallbackTurf = [
-        { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (1,000,000 TPM Free Tier)' },
-        { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning)' },
+        { cmd: '/model gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
+        { cmd: '/model gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Deep reasoning)' },
+        { cmd: '/model gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast)' },
         { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
         { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
         { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
@@ -1422,6 +1423,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       debounceTimers.set(normalizedRel, setTimeout(() => {
         debounceTimers.delete(normalizedRel);
         try {
+          refreshFileList(true);
           const fullPath = path.join(currentDir, normalizedRel);
           if (fs.existsSync(fullPath)) {
             const stat = fs.statSync(fullPath);
@@ -1443,6 +1445,14 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
     if (fileWatcher.unref) fileWatcher.unref();
   } catch (e) {}
+
+  // 5-Second periodic file tree refresh to catch newly created/synced files
+  const fileRefreshTimer = setInterval(() => {
+    try {
+      refreshFileList(true);
+    } catch (e) {}
+  }, 5000);
+  if (fileRefreshTimer.unref) fileRefreshTimer.unref();
 
   // 5-Second rolling lock heartbeat
   const heartbeatTimer = setInterval(() => {
@@ -1530,6 +1540,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     updateFocusStyles();
     stopInputReading();
     screen.program.hideCursor();
+    try { refreshFileList(true); } catch (e) {}
     filesList.focus();
     screen.render();
   }
@@ -1631,7 +1642,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     if (currentProc) return;
     getActiveLog().log(`{cyan-fg}SYSTEM>{/cyan-fg} Spawning automated demo...`);
     screen.render();
-    const proc = spawn('node', [path.join(TURF_ROOT, 'demo', 'run-demo.js')], { shell: true, cwd: TURF_ROOT });
+    const proc = spawn(process.execPath, [path.join(TURF_ROOT, 'demo', 'run-demo.js')], { cwd: TURF_ROOT });
     if (activeCenterTab === 'codex') activeCodexProc = proc;
     else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = proc;
     else activeTermProc = proc;

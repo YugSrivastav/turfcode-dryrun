@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 
@@ -500,11 +501,18 @@ export class PtyManager extends EventEmitter {
     const env = {
       ...process.env,
       ...(() => {
-        const p = path.join(cwd, '.env');
-        if (fs.existsSync(p)) {
-          try { return dotenv.parse(fs.readFileSync(p, 'utf8')); } catch (e) {}
+        const envPaths = [
+          path.join(os.homedir(), '.turf', '.env'),
+          path.join(process.cwd(), '.env'),
+          path.join(cwd, '.env')
+        ];
+        let merged = {};
+        for (const p of envPaths) {
+          if (fs.existsSync(p)) {
+            try { Object.assign(merged, dotenv.parse(fs.readFileSync(p, 'utf8'))); } catch (e) {}
+          }
         }
-        return {};
+        return merged;
       })(),
       ...(options.env || {}),
       TERM: 'xterm-256color',
@@ -620,7 +628,12 @@ export class PtyManager extends EventEmitter {
       }
 
       if (config.model && config.model !== 'default') {
-        const m = config.model;
+        let m = config.model;
+        if (m === 'gemini-2.5-flash' || m === 'gemini-2.5-flash-lite') {
+          m = 'gemini-2.0-flash';
+        } else if (m === 'gemini-2.5-pro') {
+          m = 'gemini-1.5-pro';
+        }
         if ((m.startsWith('llama') || m.includes('qwen') || m.includes('gpt-oss') || m.includes('compound')) && !m.includes('/')) {
           args.push('--provider', 'groq', '--model', m);
         } else if ((m.startsWith('gemini') || m.startsWith('gemma')) && !m.includes('/')) {
@@ -629,13 +642,13 @@ export class PtyManager extends EventEmitter {
           args.push('--model', m);
         }
       } else if (env.GEMINI_API_KEY && (!env.GROQ_API_KEY || config.lastTurnFailed)) {
-        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+        args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
       } else if (!env.ANTHROPIC_API_KEY && env.GROQ_API_KEY) {
         args.push('--provider', 'groq', '--model', 'openai/gpt-oss-120b');
       } else if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
         args.push('--provider', 'openai', '--model', 'gpt-4o');
       } else if (!env.ANTHROPIC_API_KEY && env.GEMINI_API_KEY) {
-        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+        args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
       }
       if (config.effort && config.effort !== 'medium') {
         args.push('--thinking', config.effort);

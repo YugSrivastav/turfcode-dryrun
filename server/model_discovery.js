@@ -121,9 +121,9 @@ export async function getTurfModels(cwd) {
 
   if (process.env.GEMINI_API_KEY) {
     models.push(
-      { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (1,000,000 TPM Free Tier - Recommended)' },
-      { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning)' },
-      { id: 'gemini-2.5-flash-lite', label: 'gemini-2.5-flash-lite', desc: 'Google Gemini 2.5 Flash-Lite (Ultra-fast)' }
+      { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier - Recommended)' },
+      { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast Free Tier)' },
+      { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Deep reasoning)' }
     );
   }
 
@@ -169,7 +169,7 @@ export async function getTurfModels(cwd) {
   }
 
   return [
-    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (1,000,000 TPM Free Tier)' },
+    { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
     { id: 'llama-3.1-8b-instant', label: 'llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
     { id: 'openai/gpt-oss-120b', label: 'openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Recommended)' },
     { id: 'claude-3-5-sonnet', label: 'claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
