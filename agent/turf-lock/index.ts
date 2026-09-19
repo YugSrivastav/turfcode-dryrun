@@ -37,6 +37,46 @@ function runHook(args: string[]): Promise<{ code: number; stdout: string }> {
 }
 
 export default function (pi: ExtensionAPI) {
+  const lockedFiles = new Set<string>();
+  const speculativeTargets = new Map<string, string>(); // rel -> abs worktree path
+
+  const syncWorktreeFile = async (rel: string, targetPath: string) => {
+    try {
+      const fs = await import("node:fs");
+      if (fs.existsSync(targetPath)) {
+        const content = fs.readFileSync(targetPath, "utf8");
+        await runHook(["--sync-worktree", "--file", rel, "--content", content]);
+      }
+    } catch {}
+  };
+
+  const releaseAll = async () => {
+    if (lockedFiles.size === 0) return;
+    const files = Array.from(lockedFiles);
+    lockedFiles.clear();
+    for (const f of files) {
+      try {
+        await runHook(["--release", "--file", f]);
+      } catch {}
+    }
+  };
+
+  if (typeof (pi as any).on === "function") {
+    pi.on("agent_end", async () => {
+      for (const [rel, target] of speculativeTargets.entries()) {
+        await syncWorktreeFile(rel, target);
+      }
+      speculativeTargets.clear();
+      await releaseAll();
+    });
+
+    pi.on("tool_result", async () => {
+      for (const [rel, target] of speculativeTargets.entries()) {
+        await syncWorktreeFile(rel, target);
+      }
+    });
+  }
+
   pi.on("tool_call", async (event, ctx) => {
     if (!WRITE_TOOLS.has(event.toolName)) return;
     const target = targetPath((event as any).input);
@@ -44,18 +84,39 @@ export default function (pi: ExtensionAPI) {
 
     const rel = path.relative(ctx.cwd, path.resolve(ctx.cwd, target)).replace(/\\/g, "/");
     const { code, stdout } = await runHook(["--file", rel]);
-    if (code === 0) return; // granted: write to main
+    if (code === 0) {
+      lockedFiles.add(rel);
+      return; // granted: write to main
+    }
     if (code !== 2) return; // hook error: fail open
 
     // conflict: redirect into the speculative worktree (input is mutable, no revalidation)
     try {
       const data = JSON.parse(stdout);
-      const worktree = String(data.worktreePath || "");
+      const worktree = String(data.localWorktreePath || data.worktreePath || "");
       if (!worktree) return;
-      (event as any).input.path = path.join(worktree, rel);
+      const worktreeTarget = path.join(worktree, rel);
+
+      // Cold-start seed: copy existing file into worktree if missing
+      try {
+        const fs = await import("node:fs");
+        fs.mkdirSync(path.dirname(worktreeTarget), { recursive: true });
+        const localSource = path.resolve(ctx.cwd, rel);
+        if (!fs.existsSync(worktreeTarget) && fs.existsSync(localSource)) {
+          fs.copyFileSync(localSource, worktreeTarget);
+        }
+      } catch {}
+
+      for (const key of ["path", "file", "target", "filename", "filepath"]) {
+        if (typeof (event as any).input[key] === "string") {
+          (event as any).input[key] = worktreeTarget;
+        }
+      }
+      speculativeTargets.set(rel, worktreeTarget);
       if (ctx.hasUI) ctx.ui.notify(`Turf conflict on ${rel}: forked to worktree`, "warning");
     } catch {
       return;
     }
   });
 }
+

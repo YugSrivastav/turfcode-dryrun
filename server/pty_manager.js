@@ -4,7 +4,7 @@ import { spawn, execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import dotenv from 'dotenv';
 
 import pkgHeadless from '@xterm/headless';
@@ -12,12 +12,41 @@ const { Terminal } = pkgHeadless;
 import pkgSerialize from '@xterm/addon-serialize';
 const { SerializeAddon } = pkgSerialize;
 import { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from './model_discovery.js';
+import { lockRegistry } from './locks.js';
 
 const require = createRequire(import.meta.url);
 
 // Repo root (server/pty_manager.js -> repo root) for the built-in turf wrapper.
 const TURF_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const TURF_WRAPPER = path.join(TURF_ROOT, 'bin', 'turf-agent.js');
+const TURF_GUARD_LOADER = path.join(TURF_ROOT, 'server', 'turf-guard-loader.mjs');
+
+export function extractFileCandidates(prompt, cwd = process.cwd()) {
+  if (!prompt || typeof prompt !== 'string') return [];
+  const candidates = new Set();
+  const fileRegex = /\b([a-zA-Z0-9_\-\.\/\\]+\.[a-zA-Z0-9_\-]+)\b/g;
+  let match;
+  while ((match = fileRegex.exec(prompt)) !== null) {
+    let candidate = match[1].replace(/\\/g, '/').replace(/^\.\//, '');
+    if (/^\d+(\.\d+)+$/.test(candidate) || candidate.includes('http:') || candidate.includes('https:')) {
+      continue;
+    }
+    if (candidate.startsWith('-')) continue;
+
+    try {
+      const full = path.resolve(cwd, candidate);
+      if (fs.existsSync(full)) {
+        candidates.add(candidate);
+      } else if (candidate.includes('/') || /\.(js|ts|jsx|tsx|json|md|html|css|py|rs|go|sh)$/i.test(candidate)) {
+        candidates.add(candidate);
+      }
+    } catch (e) {
+      if (candidate.includes('/')) candidates.add(candidate);
+    }
+  }
+  return Array.from(candidates);
+}
+
 
 function resolveTurf() {
   // Prefer a globally installed `turf` binary, fall back to the built-in wrapper.
@@ -521,6 +550,23 @@ export class PtyManager extends EventEmitter {
       CLOUD_ENV: 'CLOUD_ENVIRONMENT_PROD'
     };
 
+    const isAgentTab = (tabId === 'codex' || tabId === 'cmdc' || tabId === 'agy' || tabId === 'turf');
+    const prompt = inputCmd ? inputCmd.trim() : '';
+
+    if (isAgentTab) {
+      if (!prompt) {
+        return null;
+      }
+      // Phase 1: Pre-Flight Intent Declaration
+      const candidateFiles = extractFileCandidates(prompt, cwd);
+      const user = options.user || process.env.TURF_USER || (tabId === 'turf' ? 'turf' : (tabId === 'codex' ? 'codex' : 'cmdc'));
+      lockRegistry.declareIntent(tabId, user, candidateFiles, candidateFiles.length > 0 ? 'targeted' : 'recon');
+      env.TURF_DAEMON = process.env.TURF_DAEMON || 'http://127.0.0.1:7873';
+      env.TURF_ROOM = options.room || process.env.TURF_ROOM || 'TRF-XXXX';
+      env.TURF_USER = user;
+      env.TURF_AGENT_ID = tabId;
+    }
+
     let file = '';
     let args = [];
 
@@ -531,11 +577,6 @@ export class PtyManager extends EventEmitter {
       }
       file = bin;
       const config = this.getAgentConfig('codex');
-      const prompt = inputCmd ? inputCmd.trim() : '';
-
-      if (!prompt) {
-        return null;
-      }
 
       if (config.sessionId) {
         // Resume existing multi-turn session with full history
@@ -577,18 +618,19 @@ export class PtyManager extends EventEmitter {
         throw new Error('Command Code (cmdc) CLI is not installed or not in PATH.');
       }
       const config = this.getAgentConfig(tabId);
-      const prompt = inputCmd ? inputCmd.trim() : '';
-
-      if (!prompt) {
-        return null;
-      }
 
       if (bin.endsWith('.mjs') || bin.endsWith('.js')) {
         file = process.execPath;
         args = [bin, '-p', prompt, '--output-format', 'json', '--trust'];
+        if (fs.existsSync(TURF_GUARD_LOADER)) {
+          args.unshift('--import', pathToFileURL(TURF_GUARD_LOADER).href);
+        }
       } else {
         file = bin;
         args = ['-p', prompt, '--output-format', 'json', '--trust'];
+        if (fs.existsSync(TURF_GUARD_LOADER)) {
+          env.NODE_OPTIONS = (env.NODE_OPTIONS ? env.NODE_OPTIONS + ' ' : '') + `--import "${pathToFileURL(TURF_GUARD_LOADER).href}"`;
+        }
       }
 
       if (config.sessionId) {
@@ -612,11 +654,7 @@ export class PtyManager extends EventEmitter {
       }
       file = resolved.file;
       const config = this.getAgentConfig('turf');
-      const prompt = inputCmd ? inputCmd.trim() : '';
 
-      if (!prompt) {
-        return null;
-      }
 
       // Pi-native flags: --mode json event stream, -c/--session resume,
       // --thinking effort, --tools allowlist as the read-only/plan gate.
@@ -669,7 +707,6 @@ export class PtyManager extends EventEmitter {
       }
     }
 
-    const isAgentTab = (tabId === 'codex' || tabId === 'cmdc' || tabId === 'agy' || tabId === 'turf');
     let proc = null;
     let isPty = false;
 
@@ -715,6 +752,11 @@ export class PtyManager extends EventEmitter {
     if (!proc) {
       throw new Error(`Failed to spawn process for ${tabId} (${file})`);
     }
+
+    if (proc && proc.pid) {
+      lockRegistry.associateProcess(tabId, proc.pid);
+    }
+
 
     const virtualTerminal = isAgentTab ? null : new Terminal({
       cols,
@@ -851,6 +893,8 @@ export class PtyManager extends EventEmitter {
     }
 
     proc.on('exit', (exitCode) => {
+      lockRegistry.clearIntent(tabId);
+      lockRegistry.releaseAllForUser(tabId);
       session.proc = null;
       session.status = exitCode === 0 ? 'done' : 'idle';
       session.details = exitCode === 0 ? 'Done' : (exitCode !== null ? `Exited (${exitCode})` : '');
@@ -889,6 +933,8 @@ export class PtyManager extends EventEmitter {
   }
 
   killSession(tabId) {
+    lockRegistry.clearIntent(tabId);
+    lockRegistry.releaseAllForUser(tabId);
     const session = this.sessions.get(tabId);
     if (!session || !session.proc) return;
     try {

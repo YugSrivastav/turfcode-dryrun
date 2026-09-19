@@ -168,7 +168,8 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
       const payload = JSON.stringify({
         type: 'locks:update',
         activeLocks: state.activeLocks,
-        queues: state.queues
+        queues: state.queues,
+        intents: state.intents
       });
       wss.clients.forEach(client => {
         if (client.readyState === 1) client.send(payload);
@@ -178,13 +179,67 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
 
   lockRegistry.on('change', broadcastLocks);
 
+  lockRegistry.on('promoted', (info) => {
+    try {
+      const payload = JSON.stringify({
+        type: 'queue:promoted',
+        ...info,
+        timestamp: Date.now()
+      });
+      wss.clients.forEach(client => {
+        if (client.readyState === 1) client.send(payload);
+      });
+      if (info.worktreeResult && info.worktreeResult.merged) {
+        const mergeNotice = JSON.stringify({
+          type: 'chat:message',
+          user: 'SYSTEM',
+          message: `🔀 Auto-merged speculative worktree for ${info.filePath} (${info.user}) after queue promotion.`,
+          timestamp: Date.now()
+        });
+        wss.clients.forEach(client => {
+          if (client.readyState === 1) client.send(mergeNotice);
+        });
+      }
+    } catch (e) {}
+  });
+
   app.get('/api/locks', (req, res) => {
     res.json(lockRegistry.getState());
   });
 
+  app.post('/api/locks/intent', (req, res) => {
+    const { agentId, user, files, scope, action } = req.body;
+    if (action === 'clear') {
+      lockRegistry.clearIntent(agentId);
+      return res.json({ status: 'cleared' });
+    }
+    const intent = lockRegistry.declareIntent(agentId, user, files, scope);
+    res.json({ status: 'declared', intent });
+  });
+
   app.post('/api/locks/request', (req, res) => {
-    const { filePath, agentId, user, priorityTier, room: reqRoom } = req.body;
-    const result = lockRegistry.requestLock(filePath, agentId, user, priorityTier, reqRoom || room.code);
+    const { filePath, files, agentId, user, priorityTier, room: reqRoom, pid, isRemote, remotePeer } = req.body;
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+    const isLocalIp = clientIp === '127.0.0.1' || clientIp === '::1' || clientIp === '::ffff:127.0.0.1' || clientIp.endsWith('127.0.0.1');
+    const isRemoteClient = Boolean(isRemote || remotePeer || (!isLocalIp && user !== 'Host' && user !== 'LocalHost'));
+
+    // Associate unassigned WebSocket connections if any client connected from this request
+    if (user || agentId) {
+      for (const client of wss.clients) {
+        if (!client.user && !client.peerId) {
+          client.user = user;
+          client.agentId = agentId;
+          break;
+        }
+      }
+    }
+
+    if (Array.isArray(files) && files.length > 0) {
+      const results = lockRegistry.requestLocks(files, agentId, user, priorityTier, reqRoom || room.code, pid, isRemoteClient);
+      const anyConflict = results.some(r => r.status === 'conflict');
+      return res.json({ status: anyConflict ? 'conflict' : 'granted', results });
+    }
+    const result = lockRegistry.requestLock(filePath, agentId, user, priorityTier, reqRoom || room.code, pid, isRemoteClient);
     if (result && result.status === 'conflict') {
       try {
         const negMsg = {
@@ -199,14 +254,43 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
           timestamp: Date.now()
         };
         handleEvent(null, wss, room, negMsg);
+
+        const conflictMsg = JSON.stringify({
+          type: 'lock:conflict',
+          filePath,
+          agentId,
+          user: user || 'Peer',
+          priorityTier: priorityTier || 1,
+          queuePosition: result.queuePosition,
+          effectivePriority: result.effectivePriority,
+          estimatedWaitMs: result.estimatedWaitMs,
+          totalQueued: result.totalQueued,
+          timestamp: Date.now()
+        });
+        wss.clients.forEach(client => {
+          if (client.readyState === 1) client.send(conflictMsg);
+        });
       } catch (e) {}
     }
     res.json(result);
   });
 
   app.post('/api/locks/release', (req, res) => {
-    const { filePath, agentId } = req.body;
+    const { filePath, files, agentId } = req.body;
+    if (Array.isArray(files) && files.length > 0) {
+      const results = lockRegistry.releaseLocks(files, agentId);
+      return res.json({ status: 'released', results });
+    }
     const result = lockRegistry.releaseLock(filePath, agentId);
+    res.json(result);
+  });
+
+  app.post('/api/locks/worktree', (req, res) => {
+    const { filePath, agentId, room: worktreeRoom, content } = req.body;
+    if (!filePath || !agentId) {
+      return res.status(400).json({ error: 'filePath and agentId required' });
+    }
+    const result = lockRegistry.saveWorktreeFile(filePath, agentId, worktreeRoom || room || 'default', content || '');
     res.json(result);
   });
 
@@ -232,6 +316,7 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
     res.json({ status: 'ok' });
   });
 
+
   const __filename = fileURLToPath(import.meta.url);
   const __dirname = path.dirname(__filename);
   const clientDistPath = path.resolve(__dirname, '../client/dist');
@@ -253,7 +338,8 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
       const initialLocks = JSON.stringify({
         type: 'locks:update',
         activeLocks: lockRegistry.getState().activeLocks,
-        queues: lockRegistry.getState().queues
+        queues: lockRegistry.getState().queues,
+        intents: lockRegistry.getState().intents
       });
       ws.send(initialLocks);
     } catch (e) {}
@@ -270,8 +356,17 @@ export async function spawnHostDaemon({ hostName, repoPath, port = 7873, tunnel 
     ws.on('close', () => {
       if (ws.peerId) {
         room.removePeer(ws.peerId);
+        lockRegistry.unregisterRemotePeer(ws.peerId);
         lockRegistry.releaseAllForUser(ws.peerId);
-        if (ws.user) lockRegistry.releaseAllForUser(ws.user);
+      }
+      if (ws.user) {
+        lockRegistry.unregisterRemotePeer(ws.user);
+        lockRegistry.releaseAllForUser(ws.user);
+      }
+      if (ws.agentId) {
+        lockRegistry.releaseAllForUser(ws.agentId);
+      }
+      if (ws.peerId) {
         const msgString = JSON.stringify({ type: 'peer:update', peers: room.getMetadata().peers });
         wss.clients.forEach(client => {
           if (client.readyState === 1) client.send(msgString);

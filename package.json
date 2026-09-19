@@ -21,7 +21,7 @@
     "turf": "node bin/turf.js",
     "demo": "node demo/run-demo.js",
     "test": "node test/e2e-test.js",
-    "build:client": "node client/test-build.js"
+    "build:client": "npm --prefix client run build"
   },
   "engines": {
     "node": ">=20.0.0"

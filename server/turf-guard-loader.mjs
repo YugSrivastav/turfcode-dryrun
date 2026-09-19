@@ -29,9 +29,21 @@ function shouldGuard(targetPath) {
   return abs.startsWith(cwd);
 }
 
+function syncWorktreeToDaemon(relPath, worktreeFilePath) {
+  if (!daemon || !relPath) return;
+  try {
+    const content = fs.existsSync(worktreeFilePath) ? fs.readFileSync(worktreeFilePath, 'utf8') : '';
+    fetch(`${daemon}/api/locks/worktree`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ filePath: relPath, agentId, room, user, content })
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 function checkLock(targetPath) {
   if (!shouldGuard(targetPath) || !fs.existsSync(HOOK_SCRIPT)) {
-    return { ok: true, redirectPath: null };
+    return { ok: true, redirectPath: null, rel: null };
   }
   const rel = path.relative(process.cwd(), path.resolve(process.cwd(), targetPath)).replace(/\\/g, '/');
   try {
@@ -41,21 +53,28 @@ function checkLock(targetPath) {
       { timeout: 3000, encoding: 'utf8' }
     );
     if (res.status === 0) {
-      return { ok: true, redirectPath: null };
+      return { ok: true, redirectPath: null, rel };
     }
     if (res.status === 2 && res.stdout) {
-      // Conflict: parse worktree path
+      // Conflict: parse local or daemon worktree path
       const data = JSON.parse(res.stdout);
-      if (data.worktreePath) {
-        const redirected = path.join(data.worktreePath, rel);
-        try { fs.mkdirSync(path.dirname(redirected), { recursive: true }); } catch (e) {}
-        return { ok: true, redirectPath: redirected };
+      const targetWorktree = data.localWorktreePath || data.worktreePath;
+      if (targetWorktree) {
+        const redirected = path.join(targetWorktree, rel);
+        try {
+          fs.mkdirSync(path.dirname(redirected), { recursive: true });
+          const origFile = path.resolve(process.cwd(), targetPath);
+          if (!fs.existsSync(redirected) && fs.existsSync(origFile)) {
+            fs.copyFileSync(origFile, redirected);
+          }
+        } catch (e) {}
+        return { ok: true, redirectPath: redirected, rel };
       }
     }
   } catch (e) {
     // Fail open
   }
-  return { ok: true, redirectPath: null };
+  return { ok: true, redirectPath: null, rel };
 }
 
 // Patch fs.writeFileSync
@@ -64,7 +83,9 @@ fs.writeFileSync = function (file, data, options) {
   if (typeof file === 'string') {
     const check = checkLock(file);
     if (check.redirectPath) {
-      return origWriteFileSync.call(fs, check.redirectPath, data, options);
+      const res = origWriteFileSync.call(fs, check.redirectPath, data, options);
+      syncWorktreeToDaemon(check.rel, check.redirectPath);
+      return res;
     }
   }
   return origWriteFileSync.apply(fs, arguments);
@@ -77,7 +98,9 @@ if (fs.promises && fs.promises.writeFile) {
     if (typeof file === 'string') {
       const check = checkLock(file);
       if (check.redirectPath) {
-        return origPromisesWriteFile.call(fs.promises, check.redirectPath, data, options);
+        const res = await origPromisesWriteFile.call(fs.promises, check.redirectPath, data, options);
+        syncWorktreeToDaemon(check.rel, check.redirectPath);
+        return res;
       }
     }
     return origPromisesWriteFile.apply(fs.promises, arguments);
@@ -90,7 +113,9 @@ fs.appendFileSync = function (file, data, options) {
   if (typeof file === 'string') {
     const check = checkLock(file);
     if (check.redirectPath) {
-      return origAppendFileSync.call(fs, check.redirectPath, data, options);
+      const res = origAppendFileSync.call(fs, check.redirectPath, data, options);
+      syncWorktreeToDaemon(check.rel, check.redirectPath);
+      return res;
     }
   }
   return origAppendFileSync.apply(fs, arguments);
@@ -106,7 +131,10 @@ fs.writeFile = function (file, data, options, callback) {
   if (typeof file === 'string') {
     const check = checkLock(file);
     if (check.redirectPath) {
-      return origWriteFile.call(fs, check.redirectPath, data, options, callback);
+      return origWriteFile.call(fs, check.redirectPath, data, options, (err) => {
+        if (!err) syncWorktreeToDaemon(check.rel, check.redirectPath);
+        if (callback) callback(err);
+      });
     }
   }
   return origWriteFile.call(fs, file, data, options, callback);
@@ -119,7 +147,9 @@ if (fs.promises && fs.promises.appendFile) {
     if (typeof file === 'string') {
       const check = checkLock(file);
       if (check.redirectPath) {
-        return origPromisesAppendFile.call(fs.promises, check.redirectPath, data, options);
+        const res = await origPromisesAppendFile.call(fs.promises, check.redirectPath, data, options);
+        syncWorktreeToDaemon(check.rel, check.redirectPath);
+        return res;
       }
     }
     return origPromisesAppendFile.apply(fs.promises, arguments);

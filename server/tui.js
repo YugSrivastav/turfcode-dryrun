@@ -5,6 +5,8 @@ import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import fs from 'fs';
 import { ptyManager, safeEscape, getPaletteModelsForTab, getCmdcModels } from './pty_manager.js';
+import { lockRegistry } from './locks.js';
+
 
 // Patch blessed textarea and textbox to prevent unhandled TypeError: this._done is not a function
 // when Enter or Escape is pressed without an active readInput() cycle.
@@ -1291,22 +1293,79 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     content: ' {bold}ACTIVE TURFS:{/bold}\n  {grey-fg}(No active locks){/grey-fg}\n\n {bold}ALERTS:{/bold}\n  {grey-fg}(No alerts){/grey-fg}'
   });
 
+  const queueBox = blessed.box({
+    parent: rightSidebar,
+    top: 0,
+    left: 0,
+    width: '100%',
+    height: 9,
+    label: ' {grey-fg}INTENT [F2] │{/grey-fg} {bold}{magenta-fg}● QUEUE{/magenta-fg}{/bold} ',
+    border: { type: 'line', fg: 'magenta' },
+    tags: true,
+    mouse: true,
+    content: '  {grey-fg}(0 agents waiting){/grey-fg}'
+  });
+
+  let rightSidebarView = 'intent';
+  queueBox.hide();
+
+  function toggleRightSection() {
+    if (rightSidebarView === 'intent') {
+      rightSidebarView = 'queue';
+      intentBox.hide();
+      queueBox.show();
+    } else {
+      rightSidebarView = 'intent';
+      queueBox.hide();
+      intentBox.show();
+    }
+    screen.render();
+  }
+
+  intentBox.on('click', toggleRightSection);
+  queueBox.on('click', toggleRightSection);
+
   const peerAgents = new Map();
   let currentLocks = [];
   let currentQueues = [];
+  let currentIntents = [];
+
+  if (lockRegistry && typeof lockRegistry.on === 'function') {
+    lockRegistry.on('change', (state) => {
+      if (state) {
+        currentLocks = state.activeLocks || [];
+        currentQueues = state.queues || [];
+        currentIntents = state.intents || [];
+        updateIntentBox();
+        updateQueueBox();
+      }
+    });
+  }
 
   function updateIntentBox() {
     let content = ' {bold}ACTIVE TURFS:{/bold}\n';
+    let hasEntries = false;
     if (currentLocks && currentLocks.length > 0) {
       currentLocks.forEach(l => {
         const file = path.basename(l.filePath || l.file || '');
         const holder = l.agentId || l.user || 'agent';
         content += `  {yellow-fg}🔒 ${holder}:{/yellow-fg} {white-fg}${file}{/white-fg}\n`;
+        hasEntries = true;
       });
-    } else {
+    }
+    if (currentIntents && currentIntents.length > 0) {
+      currentIntents.forEach(item => {
+        const who = item.user || item.agentId || 'agent';
+        const files = (item.files && item.files.length > 0) ? item.files.map(f => path.basename(f)).join(', ') : (item.scope || 'recon');
+        content += `  {cyan-fg}⚡ ${who}:{/cyan-fg} {white-fg}${files}{/white-fg} {grey-fg}[INTENT]{/grey-fg}\n`;
+        hasEntries = true;
+      });
+    }
+    if (!hasEntries) {
       content += '  {grey-fg}(No active locks){/grey-fg}\n';
     }
     content += '\n {bold}AI AGENTS:{/bold}\n';
+
     
     let hasAgents = false;
     const cmdcSt = ptyManager.getStatus('cmdc');
@@ -1351,11 +1410,21 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     let totalWaiting = 0;
     if (currentQueues && currentQueues.length > 0) {
       currentQueues.forEach(q => {
-        const count = q.size || (Array.isArray(q.queue) ? q.queue.length : 0);
+        const count = q.size || (Array.isArray(q.requests) ? q.requests.length : (Array.isArray(q.queue) ? q.queue.length : 0));
         if (count > 0) {
           totalWaiting += count;
           const file = path.basename(q.filePath || '');
-          content += `  {magenta-fg}⏳ ${count} waiting:{/magenta-fg} {white-fg}${file}{/white-fg}\n`;
+          content += `  {magenta-fg}⏳ ${file} (${count} queued):{/magenta-fg}\n`;
+          if (Array.isArray(q.requests) && q.requests.length > 0) {
+            q.requests.forEach(r => {
+              const waitSec = typeof r.estimatedWaitSeconds === 'number' ? `${r.estimatedWaitSeconds}s` : 'wait';
+              const pScore = typeof r.effectivePriority === 'number' ? `P:${Math.round(r.effectivePriority)}` : '';
+              const branchTag = r.speculativeWorktree ? ' {cyan-fg}[BRANCH]{/cyan-fg}' : '';
+              const who = r.user || 'agent';
+              const ag = r.agent ? ` (${r.agent})` : '';
+              content += `    ↳ #{r.rank} {bold}${who}${ag}{/bold} [${pScore}, ~${waitSec}]${branchTag}\n`;
+            });
+          }
         }
       });
     }
@@ -1454,37 +1523,6 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     screen.render();
   });
 
-  const queueBox = blessed.box({
-    parent: rightSidebar,
-    top: 0,
-    left: 0,
-    width: '100%',
-    height: 9,
-    label: ' {grey-fg}INTENT [F2] │{/grey-fg} {bold}{magenta-fg}● QUEUE{/magenta-fg}{/bold} ',
-    border: { type: 'line', fg: 'magenta' },
-    tags: true,
-    mouse: true,
-    content: '  {grey-fg}(0 agents waiting){/grey-fg}'
-  });
-
-  let rightSidebarView = 'intent';
-  queueBox.hide();
-
-  function toggleRightSection() {
-    if (rightSidebarView === 'intent') {
-      rightSidebarView = 'queue';
-      intentBox.hide();
-      queueBox.show();
-    } else {
-      rightSidebarView = 'intent';
-      queueBox.hide();
-      intentBox.show();
-    }
-    screen.render();
-  }
-
-  intentBox.on('click', toggleRightSection);
-  queueBox.on('click', toggleRightSection);
 
   const chatLogBox = blessed.log({
     parent: rightSidebar,
@@ -1566,6 +1604,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       } else if (data.type === 'locks:update' || data.type === 'lock:update') {
         currentLocks = data.activeLocks || data.locks || [];
         currentQueues = data.queues || [];
+        currentIntents = data.intents || [];
         updateIntentBox();
         updateQueueBox();
       } else if (data.type === 'agent:negotiate') {
@@ -1610,7 +1649,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
   const syncSuppressionMap = new Map();
   const debounceTimers = new Map();
-  const IGNORE_SYNC = new Set(['.git', 'node_modules', '.turf', 'dist', '.env', 'turf-error.log', 'turf-sync.tar.gz', '.gemini', '.turbo', '.cache']);
+  const IGNORE_SYNC = new Set(['.git', 'node_modules', '.turf', 'dist', '.env', 'turf-error.log', 'turf-sync.tar.gz', '.gemini', '.turbo', '.cache', 'turf-worktrees', '.turf-worktrees']);
 
   // Native debounced file watcher for real-time peer replication
   try {
@@ -1682,6 +1721,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         if (data) {
           currentLocks = data.activeLocks || [];
           currentQueues = data.queues || [];
+          currentIntents = data.intents || [];
           updateIntentBox();
           updateQueueBox();
         }
@@ -2298,9 +2338,12 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     }
 
     try {
-      const env = agent === 'turf'
-        ? { TURF_DAEMON: `http://${hostAddress || '127.0.0.1'}:${port}`, TURF_ROOM: roomCode, TURF_USER: hostName, TURF_AGENT_ID: 'turf' }
-        : undefined;
+      const env = {
+        TURF_DAEMON: `http://${hostAddress || '127.0.0.1'}:${port}`,
+        TURF_ROOM: roomCode,
+        TURF_USER: hostName,
+        TURF_AGENT_ID: agent
+      };
       ptyManager.spawnSession(agent, inputStr, { cwd: currentDir, env });
     } catch (err) {
       targetLog.log(`{red-fg}Error starting ${agent.toUpperCase()}: ${err.message}{/red-fg}`);

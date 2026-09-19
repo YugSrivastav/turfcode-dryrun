@@ -32,6 +32,9 @@ export function handleEvent(ws, wss, room, data) {
   if (data.type === 'peer:join') {
     const peerId = data.user + '_' + Date.now();
     ws.peerId = peerId;
+    ws.user = data.user;
+    lockRegistry.registerRemotePeer(data.user);
+    lockRegistry.registerRemotePeer(peerId);
     room.addPeer(peerId, data.user, data.role, '127.0.0.1');
     
     broadcast(wss, { type: 'peer:update', peers: room.getMetadata().peers });

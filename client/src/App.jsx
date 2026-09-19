@@ -74,14 +74,33 @@ function App() {
 
           fetch(`http://${host}:${portParam}/api/locks`)
             .then(res => res.json())
-            .then(locks => {
-              if (Array.isArray(locks)) {
-                setActiveLocks(locks.map(l => ({
+            .then(data => {
+              if (data) {
+                const locksList = Array.isArray(data) ? data : (data.activeLocks || []);
+                setActiveLocks(locksList.map(l => ({
                   file: l.filePath || l.file,
                   user: l.user || 'Unknown',
                   agent: l.agentId || l.agent || 'turf',
                   ttl: Math.max(1, Math.round(((l.expiresAt || Date.now() + 15000) - Date.now()) / 1000))
                 })));
+
+                const queuesList = Array.isArray(data.queues) ? data.queues : [];
+                const flatQueue = [];
+                queuesList.forEach(q => {
+                  const reqs = Array.isArray(q.requests) ? q.requests : (Array.isArray(q.queue) ? q.queue : []);
+                  reqs.forEach(r => {
+                    flatQueue.push({
+                      id: `${q.filePath}-${r.agentId || r.user}-${r.enqueuedTime || Math.random()}`,
+                      file: q.filePath,
+                      user: r.user || 'Unknown',
+                      agent: r.agent || r.agentId || 'turf',
+                      rank: r.rank || 1,
+                      priority: `Rank #${r.rank || 1} [Tier ${r.priorityTier !== undefined ? r.priorityTier : 1}, P:${Math.round(r.effectivePriority || 0)}]`,
+                      estimatedWait: r.estimatedWaitSeconds || 0
+                    });
+                  });
+                });
+                setQueue(flatQueue);
               }
             }).catch(() => {});
         };
@@ -104,6 +123,39 @@ function App() {
                 user: data.user || 'Team',
                 message: data.message || ''
               }]);
+            } else if (data.type === 'locks:update' || data.type === 'lock:update') {
+              const locksList = data.activeLocks || data.locks || [];
+              setActiveLocks(locksList.map(l => ({
+                file: l.filePath || l.file,
+                user: l.user || 'Unknown',
+                agent: l.agentId || l.agent || 'turf',
+                ttl: Math.max(1, Math.round(((l.expiresAt || Date.now() + 15000) - Date.now()) / 1000))
+              })));
+
+              const queuesList = Array.isArray(data.queues) ? data.queues : [];
+              const flatQueue = [];
+              queuesList.forEach(q => {
+                const reqs = Array.isArray(q.requests) ? q.requests : (Array.isArray(q.queue) ? q.queue : []);
+                reqs.forEach(r => {
+                  flatQueue.push({
+                    id: `${q.filePath}-${r.agentId || r.user}-${r.enqueuedTime || Math.random()}`,
+                    file: q.filePath,
+                    user: r.user || 'Unknown',
+                    agent: r.agent || r.agentId || 'turf',
+                    rank: r.rank || 1,
+                    priority: `Rank #${r.rank || 1} [Tier ${r.priorityTier !== undefined ? r.priorityTier : 1}, P:${Math.round(r.effectivePriority || 0)}]`,
+                    estimatedWait: r.estimatedWaitSeconds || 0
+                  });
+                });
+              });
+              setQueue(flatQueue);
+            } else if (data.type === 'queue:promoted') {
+              setAlerts(prev => [{
+                id: Date.now(),
+                time: new Date().toLocaleTimeString(),
+                text: `🎉 ${data.user} (${data.agentId}) promoted from queue for ${data.filePath}!${data.worktreeResult && data.worktreeResult.merged ? ' (Auto-merged worktree)' : ''}`,
+                action: 'info'
+              }, ...prev.slice(0, 4)]);
             } else if (data.type === 'lock:granted') {
               setActiveLocks(prev => {
                 const filtered = prev.filter(l => l.file !== data.filePath);
@@ -131,7 +183,8 @@ function App() {
                 file: data.filePath,
                 user: data.user,
                 agent: data.agentId || 'turf',
-                priority: `Tier ${data.priorityTier || 1}`
+                priority: `Rank #${data.queuePosition || 1} [Tier ${data.priorityTier || 1}, P:${Math.round(data.effectivePriority || 0)}]`,
+                estimatedWait: data.estimatedWaitMs ? Math.round(data.estimatedWaitMs / 1000) : 15
               }]);
               setAlerts(prev => [{
                 id: Date.now(),

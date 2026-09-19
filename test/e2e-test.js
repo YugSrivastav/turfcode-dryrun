@@ -3,13 +3,14 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import blessed from 'blessed';
 import { spawnHostDaemon, getLocalIp } from '../server/index.js';
-import { lockRegistry } from '../server/locks.js';
+import { lockRegistry, isProcessAlive } from '../server/locks.js';
 import { buildFileTree, flattenFileTree, formatTreeNode, getProjectFiles, getTruncatedPath, calculateLayout, buildHeaderContent, buildFooterContent, buildCenterLabel } from '../server/tui.js';
 import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
-import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from '../server/pty_manager.js';
+import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, extractFileCandidates } from '../server/pty_manager.js';
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
 import { getGroqApiKeys, getNextGroqApiKey } from '../server/model_discovery.js';
 import { verifyCode, extractAstSymbols } from '../server/verify.js';
+import { gitMerge3Way, astSemanticMerge, peacemakerMergeSync } from '../server/peacemaker.js';
 import WebSocket from 'ws';
 import os from 'os';
 import { execSync, execFile } from 'child_process';
@@ -39,7 +40,7 @@ async function runTests() {
     'bin/turf.js', 'bin/turf-agent.js', 'server/tui.js', 'server/index.js', 
     'server/events.js', 'server/rooms.js', 'server/locks.js',
     'server/pty_manager.js', 'server/model_discovery.js', 'server/sync.js',
-    'server/verify.js'
+    'server/verify.js', 'server/peacemaker.js', 'server/turf-hook.js', 'server/turf-guard-loader.mjs'
   ];
   for (const file of files) {
     try {
@@ -909,7 +910,492 @@ async function runTests() {
   assert(fullLabel.includes('CMDC*'), 'Full center label shows CMDC working status');
   assert(fullLabel.includes('FILE: index.js'), 'Full center label includes opened filename');
 
+  // --- Testing Multi-Agent Intent Board, Deadlock-Free Canonical Locks & Anti-Starvation Queue ---
+  console.log('\n--- Testing Multi-Agent Intent Board, Canonical Locks & Anti-Starvation Queue ---');
+
+  // 1. Windows Backslash vs POSIX Path Inode Equivalence
+  const lockWin = lockRegistry.requestLock('src\\components\\Button.jsx', 'agent-win-1', 'Alice');
+  assert(lockWin.status === 'granted', 'Lock acquired with Windows backslash path');
+  const lockPosix = lockRegistry.requestLock('src/components/Button.jsx', 'agent-posix-2', 'Bob');
+  assert(lockPosix.status === 'conflict', 'POSIX forward-slash path correctly matches Windows backslash lock (no phantom bypass)');
+  lockRegistry.releaseLock('src/components/Button.jsx', 'agent-win-1');
+  const promotedPosix = lockRegistry.locks.get('src/components/Button.jsx');
+  assert(promotedPosix && promotedPosix.agentId === 'agent-posix-2', 'Queued POSIX agent automatically promoted on release of Windows path holder');
+  lockRegistry.releaseLock('src/components/Button.jsx', 'agent-posix-2');
+  assert(!lockRegistry.locks.has('src/components/Button.jsx'), 'Lock cleanly released using normalized key');
+
+
+  // 2. Canonical Total Ordering (Deadlock Freedom)
+  const unsortedPaths = ['src/z.js', 'src/a.js', 'src\\m.js', 'src/b.js'];
+  const canonicalOrdered = lockRegistry.orderPaths(unsortedPaths);
+  assert(canonicalOrdered[0] === 'src/a.js' && canonicalOrdered[1] === 'src/b.js' && canonicalOrdered[2] === 'src/m.js' && canonicalOrdered[3] === 'src/z.js', 'orderPaths provides canonical total ordering for deadlock freedom');
+
+  // 3. Deterministic File Candidate Extraction from User Prompts
+  const candidates1 = extractFileCandidates('Please fix bug in server/tui.js and test/e2e-test.js before demo');
+  assert(candidates1.includes('server/tui.js') && candidates1.includes('test/e2e-test.js'), 'extractFileCandidates extracts mentioned workspace files');
+  const candidates2 = extractFileCandidates('Create a modern landing page for hackathon demo');
+  assert(candidates2.length === 0, 'extractFileCandidates returns empty list for abstract intent');
+  const candidates3 = extractFileCandidates('Upgrade to v1.2.3 and visit https://example.com/api.js');
+  assert(!candidates3.includes('1.2.3') && !candidates3.some(c => c.includes('http')), 'extractFileCandidates ignores versions and remote URLs');
+
+  // 4. Pre-Flight Intent Registry (Phase 1 Hook)
+  lockRegistry.declareIntent('tab-cmdc', 'Dave', ['server/locks.js'], 'targeted');
+  let intents = lockRegistry.getIntents();
+  const daveIntent = intents.find(i => i.agentId === 'tab-cmdc');
+  assert(daveIntent !== undefined, 'declareIntent successfully registers agent pre-flight intent');
+  assert(daveIntent.user === 'Dave' && daveIntent.files.includes('server/locks.js'), 'Intent records user and normalized target file');
+  lockRegistry.clearIntent('tab-cmdc');
+  intents = lockRegistry.getIntents();
+  assert(intents.find(i => i.agentId === 'tab-cmdc') === undefined, 'clearIntent successfully removes completed agent intent');
+
+  // 5. Dead-Man Process Liveness Sweeper (LLM Long Reasoning Protection)
+  const dummyLockFile = 'test/liveness-test.js';
+  lockRegistry.requestLock(dummyLockFile, 'agent-alive-proc', 'Charlie', 1, 'default', process.pid);
+  const activeLock = lockRegistry.locks.get(dummyLockFile);
+  assert(activeLock !== undefined, 'Lock acquired for liveness sweeper test');
+  // Age activity by 15 seconds (past the 10s inactivity threshold)
+  activeLock.lastActivity = Date.now() - 15000;
+  activeLock.expiresAt = Date.now() - 1000;
+  lockRegistry._evictZombies();
+  assert(lockRegistry.locks.has(dummyLockFile), 'Active running PID is NOT evicted by zombie sweeper during long inference turn');
+  // Now simulate a deceased PID
+  activeLock.pid = 9999999;
+  activeLock.lastActivity = Date.now() - 15000;
+  activeLock.expiresAt = Date.now() - 1000;
+  lockRegistry._evictZombies();
+  assert(!lockRegistry.locks.has(dummyLockFile), 'Deceased PID is immediately evicted and cleaned up by sweeper');
+
+  // 6. Anti-Starvation Queue Aging (Starvation Freedom Proof)
+  const queueFile = 'test/starvation-test.js';
+  lockRegistry.requestLock(queueFile, 'agent-holder', 'Holder');
+  // Enqueue low-priority request (Tier 3, Base Score 25)
+  lockRegistry.requestLock(queueFile, 'agent-low-prio', 'LowPrio', 3);
+  const queueArr = lockRegistry.queues.get(queueFile);
+  assert(queueArr && queueArr.length === 1, 'Low priority agent enqueued');
+  // Age low priority request by 30 seconds: effective score = 25 + 3.5 * 30 = 130
+  queueArr[0].enqueuedTime = Date.now() - 30000;
+  // Enqueue freshly arrived high-priority human request (Tier 0, Base Score 100)
+  lockRegistry.requestLock(queueFile, 'agent-high-human', 'Human', 0);
+  assert(queueArr.length === 2, 'High priority human enqueued behind low priority');
+  // Release holder: promotion aging formula runs
+  lockRegistry.releaseLock(queueFile, 'agent-holder');
+  const promotedLock = lockRegistry.locks.get(queueFile);
+  assert(promotedLock && promotedLock.agentId === 'agent-low-prio', 'Aged low-priority agent promoted over newly arrived Tier 0 request (anti-starvation aging proven)');
+  lockRegistry.releaseLock(queueFile, 'agent-low-prio');
+
+  // 7. REST API /api/locks/intent Endpoint
+  const intentPostRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/intent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ agentId: 'api-agent', user: 'Eva', files: ['server/index.js'], scope: 'targeted' })
+  });
+  assert(intentPostRes.ok, 'POST /api/locks/intent returns HTTP 200');
+  const intentPostData = await intentPostRes.json();
+  assert(intentPostData.status === 'declared' && intentPostData.intent.user === 'Eva', 'POST /api/locks/intent registers intent');
+  const intentClearRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/intent`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ agentId: 'api-agent', action: 'clear' })
+  });
+  assert(intentClearRes.ok, 'POST /api/locks/intent clear returns HTTP 200');
+  const intentClearData = await intentClearRes.json();
+  assert(intentClearData.status === 'cleared', 'POST /api/locks/intent clear clears intent');
+
+  // 8. Mathematical Waiting Queue Dynamics & Position Ranking
+  console.log('\n--- Testing Mathematical Waiting Queue Dynamics ---');
+  const mathQueueFile = 'test/math-queue-target.js';
+  lockRegistry.requestLock(mathQueueFile, 'math-holder', 'HolderUser', 1);
+  const mathHolderLock = lockRegistry.locks.get(mathQueueFile);
+  assert(mathHolderLock !== undefined, 'Lock acquired for mathematical queue test');
+
+  // Enqueue 3 agents:
+  const resA = lockRegistry.requestLock(mathQueueFile, 'agent-A', 'UserA', 3);
+  const resB = lockRegistry.requestLock(mathQueueFile, 'agent-B', 'UserB', 1);
+  const resC = lockRegistry.requestLock(mathQueueFile, 'agent-C', 'UserC', 2);
+
+  assert(resA.status === 'conflict' && resB.status === 'conflict' && resC.status === 'conflict', 'All colliding requests enqueued with conflict status');
+  assert(resA.suggestedAction === 'fork_speculative_worktree', 'Colliding request suggests speculative worktree fork');
+
+  // Manipulate enqueue timestamps to test mathematical dynamic aging formula:
+  // P_eff = S_0 + 3.5 * t_elapsed
+  // Agent A (Tier 3, S_0 = 25), t_elapsed = 20s -> P_eff = 25 + 3.5 * 20 = 95
+  // Agent B (Tier 1, S_0 = 75), t_elapsed = 0s  -> P_eff = 75 + 3.5 * 0 = 75
+  // Agent C (Tier 2, S_0 = 50), t_elapsed = 15s -> P_eff = 50 + 3.5 * 15 = 102.5
+  const qArr = lockRegistry.queues.get(mathQueueFile);
+  const reqA = qArr.find(r => r.agentId === 'agent-A');
+  const reqB = qArr.find(r => r.agentId === 'agent-B');
+  const reqC = qArr.find(r => r.agentId === 'agent-C');
+
+  reqA.enqueuedTime = Date.now() - 20000;
+  reqB.enqueuedTime = Date.now();
+  reqC.enqueuedTime = Date.now() - 15000;
+
+  // Compute queue rankings
+  const computed = lockRegistry._computeQueue(mathQueueFile);
+  assert(computed[0].agentId === 'agent-C' && computed[0].rank === 1, 'Math Queue Rank #1 is Agent C (effective priority 102.5)');
+  assert(computed[1].agentId === 'agent-A' && computed[1].rank === 2, 'Math Queue Rank #2 is Agent A (effective priority 95)');
+  assert(computed[2].agentId === 'agent-B' && computed[2].rank === 3, 'Math Queue Rank #3 is Agent B (effective priority 75)');
+
+  // Verify wait time formula: estimatedWaitSeconds = holderRemaining + (rank - 1) * 15
+  assert(computed[0].estimatedWaitSeconds >= 0 && computed[0].estimatedWaitSeconds <= 15, 'Rank #1 wait time equals holder remaining time (~0-15s)');
+  assert(computed[1].estimatedWaitSeconds === computed[0].estimatedWaitSeconds + 15, 'Rank #2 wait time is Rank #1 + 15s');
+  assert(computed[2].estimatedWaitSeconds === computed[0].estimatedWaitSeconds + 30, 'Rank #3 wait time is Rank #1 + 30s');
+
+  // Verify Idempotent Enqueue (no queue bloat on repeated queries)
+  const lenBefore = qArr.length;
+  lockRegistry.requestLock(mathQueueFile, 'agent-B', 'UserB', 1);
+  assert(qArr.length === lenBefore, 'Repeated request from same agent is idempotent (does not duplicate queue entries)');
+
+  // 9. Ghost Queue Pruning & Zombie Eviction from Queues
+  console.log('\n--- Testing Ghost Queue Pruning ---');
+  qArr.push({
+    agentId: 'ghost-dead-pid',
+    user: 'DeadGhost',
+    priorityTier: 0,
+    score: 100,
+    enqueuedTime: Date.now() - 10000,
+    lastActivity: Date.now() - 10000,
+    pid: 9999999
+  });
+  qArr.push({
+    agentId: 'ghost-stale-timeout',
+    user: 'StaleGhost',
+    priorityTier: 0,
+    score: 100,
+    enqueuedTime: Date.now() - 360000, // 6 minutes ago (> 5m threshold)
+    lastActivity: Date.now() - 360000
+  });
+
+  lockRegistry._evictZombies();
+  const activeQueuedAfterEvict = lockRegistry.queues.get(mathQueueFile);
+  assert(!activeQueuedAfterEvict.some(r => r.agentId === 'ghost-dead-pid'), 'Dead PID pruned from waiting queue during sweep');
+  assert(!activeQueuedAfterEvict.some(r => r.agentId === 'ghost-stale-timeout'), 'Stale request (>5m) pruned from waiting queue during sweep');
+
+  // 10. Speculative Worktree AST Verification & Auto-Merge on Promotion
+  console.log('\n--- Testing Speculative Worktree Merge on Queue Promotion ---');
+  const specTargetRel = 'test/speculative-merge-target.js';
+  const specTargetFull = path.join(TURF_ROOT, specTargetRel);
+  fs.writeFileSync(specTargetFull, 'export const initialVal = 42;\n', 'utf8');
+
+  lockRegistry.requestLock(specTargetRel, 'holder-spec', 'Alice', 1);
+  const specEnqRes = lockRegistry.requestLock(specTargetRel, 'queued-spec-agent', 'Bob', 2, 'default');
+  assert(specEnqRes.status === 'conflict', 'Speculative agent successfully enqueued');
+
+  // Simulate queued agent writing verified changes in its speculative worktree
+  const worktreeDir = specEnqRes.worktreePath;
+  const specFileInWorktree = path.join(worktreeDir, specTargetRel);
+  fs.mkdirSync(path.dirname(specFileInWorktree), { recursive: true });
+  const validMergedJs = 'export const initialVal = 42;\nexport function newFeature() { return "verified AST"; }\n';
+  fs.writeFileSync(specFileInWorktree, validMergedJs, 'utf8');
+
+  // Release lock from Alice -> triggers _promoteQueue -> triggers _tryMergeSpeculativeWorktree
+  let promotedEventReceived = false;
+  let worktreeMergedReported = false;
+  const onPromoted = (info) => {
+    if (info.filePath === specTargetRel) {
+      promotedEventReceived = true;
+      if (info.worktreeResult && info.worktreeResult.merged) {
+        worktreeMergedReported = true;
+      }
+    }
+  };
+  lockRegistry.on('promoted', onPromoted);
+
+  const releaseRes = lockRegistry.releaseLock(specTargetRel, 'holder-spec');
+  assert(releaseRes.promotedTo === 'queued-spec-agent', 'Queued agent successfully promoted to lock holder');
+  assert(promotedEventReceived, 'promoted event emitted by lockRegistry');
+  assert(worktreeMergedReported, 'worktreeResult reported successfully merged');
+
+  // Verify file on disk in main workspace now contains the verified AST merged code
+  const mainDiskContent = fs.readFileSync(specTargetFull, 'utf8');
+  assert(mainDiskContent.includes('newFeature') && mainDiskContent.includes('verified AST'), 'Speculative worktree changes automatically merged to main workspace file');
+  assert(!fs.existsSync(specFileInWorktree), 'Temporary speculative worktree file unlinked after merge');
+
+  // Clean up
+  lockRegistry.off('promoted', onPromoted);
+  lockRegistry.releaseLock(specTargetRel, 'queued-spec-agent');
+  lockRegistry.releaseLock(mathQueueFile, 'math-holder');
+  try { fs.unlinkSync(specTargetFull); } catch (e) {}
+  try { fs.unlinkSync(path.join(TURF_ROOT, queueFile)); } catch (e) {}
+  try { fs.unlinkSync(path.join(TURF_ROOT, dummyLockFile)); } catch (e) {}
+
+  // 11. REST API /api/locks Endpoint Schema Verification
+  const locksGetRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks`);
+  assert(locksGetRes.ok, 'GET /api/locks returns HTTP 200');
+  const locksData = await locksGetRes.json();
+  assert(Array.isArray(locksData.activeLocks), 'GET /api/locks returns activeLocks array');
+  assert(Array.isArray(locksData.queues), 'GET /api/locks returns queues array');
+  assert(Array.isArray(locksData.intents), 'GET /api/locks returns intents array');
+
+  // 12. Collective Scenario Stress Testing & Deadlock Freedom
+  console.log('\n--- Testing Collective Scenarios & Deadlock Freedom ---');
+  
+  // A. Deadlock-free Batch Locking via requestLocks / releaseLocks
+  const batchFiles = ['src/components/Zebra.jsx', 'src/components/Alpha.jsx', 'src/components/Middle.jsx'];
+  const batchReqResults = lockRegistry.requestLocks(batchFiles, 'batch-agent-1', 'UserBatch', 1);
+  assert(batchReqResults.length === 3, 'Batch lock requested 3 files');
+  assert(batchReqResults.every(r => r.status === 'granted'), 'All 3 files granted in canonical order');
+  
+  // Verify that all 3 files are currently locked
+  assert(lockRegistry.locks.has('src/components/alpha.jsx'.toLowerCase()) || lockRegistry.locks.has('src/components/Alpha.jsx'), 'Alpha.jsx locked');
+  assert(lockRegistry.locks.has('src/components/zebra.jsx'.toLowerCase()) || lockRegistry.locks.has('src/components/Zebra.jsx'), 'Zebra.jsx locked');
+
+  // Second agent tries to request same batch in reverse order -> conflicts on first file without circular wait
+  const reverseFiles = ['src/components/Zebra.jsx', 'src/components/Middle.jsx', 'src/components/Alpha.jsx'];
+  const reverseReqResults = lockRegistry.requestLocks(reverseFiles, 'batch-agent-2', 'UserReverse', 1);
+  assert(reverseReqResults.every(r => r.status === 'conflict'), 'Reverse order batch safely conflicts without circular wait deadlock');
+
+  // Release batch
+  const batchRelResults = lockRegistry.releaseLocks(batchFiles, 'batch-agent-1');
+  assert(batchRelResults.length === 3 && batchRelResults.every(r => r.status === 'released'), 'Batch release frees all 3 files');
+  // Clean up remaining locks from reverse agent
+  lockRegistry.releaseLocks(batchFiles, 'batch-agent-2');
+
+  // B. Remote Peer Disconnect Guaranteed Cleanup
+  const remotePeerWs = new WebSocket(`ws://127.0.0.1:${actualPort}`);
+  await new Promise((resolve) => {
+    remotePeerWs.on('open', () => {
+      remotePeerWs.send(JSON.stringify({ type: 'peer:join', user: 'RemoteBob', role: 'Peer' }));
+      setTimeout(resolve, 300);
+    });
+  });
+
+  const remoteLockFile = 'src/remote-test.js';
+  lockRegistry.requestLock(remoteLockFile, 'RemoteBob', 'RemoteBob', 1);
+  assert(lockRegistry.locks.has(remoteLockFile), 'Lock acquired by remote peer RemoteBob');
+
+  // Now simulate sudden laptop close / WiFi drop
+  remotePeerWs.close();
+  await new Promise(resolve => setTimeout(resolve, 400));
+  assert(!lockRegistry.locks.has(remoteLockFile), 'Remote peer lock immediately freed on WebSocket disconnect (zero zombie lag)');
+
+  // C. REST API Batch Lock Endpoints
+  const batchPostRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/request`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      files: ['src/batch-api-1.js', 'src/batch-api-2.js'],
+      agentId: 'api-batch-agent',
+      user: 'BatchUser',
+      priorityTier: 1
+    })
+  });
+  assert(batchPostRes.ok, 'POST /api/locks/request batch returns HTTP 200');
+  const batchPostData = await batchPostRes.json();
+  assert(batchPostData.status === 'granted' && batchPostData.results.length === 2, 'Batch request granted all files');
+
+  const batchReleaseRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/release`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      files: ['src/batch-api-1.js', 'src/batch-api-2.js'],
+      agentId: 'api-batch-agent'
+    })
+  });
+  assert(batchReleaseRes.ok, 'POST /api/locks/release batch returns HTTP 200');
+  const batchReleaseData = await batchReleaseRes.json();
+  assert(batchReleaseData.status === 'released' && batchReleaseData.results.length === 2, 'Batch release successfully freed all files');
+
+  // 13. Parallel Collaboration Scenario: Person 1 Agent A (Login) & Person 2 Agent B (Logout) on auth.js
+  console.log('\n--- Testing Parallel Multi-Agent Collision & 3-Way AST Peacemaker Reconciliation ---');
+  
+  const authRelPath = 'test/fixtures/auth.js';
+  const authFullPath = path.join(TURF_ROOT, authRelPath);
+  fs.mkdirSync(path.dirname(authFullPath), { recursive: true });
+
+  // Common ancestor base state on disk
+  const baseAuthCode = `// auth.js - Base Module
+export const authVersion = '2.4.0';
+export const AUTH_TIMEOUT = 5000;
+`;
+  fs.writeFileSync(authFullPath, baseAuthCode, 'utf8');
+
+  // Step 1: At 10:38, Agent A (Person 1) gets command to build 'login' in auth.js
+  const lockA = lockRegistry.requestLock(authRelPath, 'agent-A-1038', 'Person1', 1, 'TRF-COLLAB');
+  assert(lockA.status === 'granted', 'Agent A acquires initial lock on auth.js at 10:38');
+  assert(lockRegistry.baseSnapshots.has(authRelPath), 'LockRegistry captures base snapshot for 3-way reconciliation');
+
+  // Step 2: At 10:39, Agent B (Person 2) gets command to build 'logout' in auth.js
+  const lockB = lockRegistry.requestLock(authRelPath, 'agent-B-1039', 'Person2', 1, 'TRF-COLLAB');
+  assert(lockB.status === 'conflict', 'Agent B safely encounters conflict at 10:39 and enters anti-starvation queue');
+  assert(lockB.suggestedAction === 'fork_speculative_worktree', 'LockRegistry advises Agent B to fork speculative worktree');
+
+  // Verify cold-start seeding: Agent B worktree file is seeded with base code so edits don't start from blank
+  const agentBWorktreeFile = path.join(lockB.worktreePath, authRelPath);
+  assert(fs.existsSync(agentBWorktreeFile), 'Agent B speculative worktree file is automatically seeded on cold-start');
+  const seededContent = fs.readFileSync(agentBWorktreeFile, 'utf8');
+  assert(seededContent.includes('authVersion') && seededContent.includes('AUTH_TIMEOUT'), 'Seeded worktree contains base symbols');
+
+  // Step 3: Agent A builds login() in main workspace
+  const agentACode = `// auth.js - Base Module
+export const authVersion = '2.4.0';
+export const AUTH_TIMEOUT = 5000;
+
+export function login(username, password) {
+  if (!username || !password) throw new Error('Credentials required');
+  return { user: username, token: 'token_' + username, timestamp: Date.now() };
+}
+`;
+  fs.writeFileSync(authFullPath, agentACode, 'utf8');
+
+  // Step 4: Agent B builds logout() in speculative worktree (simulating remote peer upload)
+  const agentBCode = `// auth.js - Base Module
+export const authVersion = '2.4.0';
+export const AUTH_TIMEOUT = 5000;
+
+export function logout(token) {
+  if (!token) return { success: false, reason: 'no_token' };
+  return { success: true, revokedAt: Date.now() };
+}
+`;
+  // Test remote worktree upload endpoint POST /api/locks/worktree
+  const uploadRes = await fetch(`http://127.0.0.1:${actualPort}/api/locks/worktree`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      filePath: authRelPath,
+      agentId: 'agent-B-1039',
+      room: 'TRF-COLLAB',
+      user: 'Person2',
+      content: agentBCode
+    })
+  });
+  assert(uploadRes.ok, 'POST /api/locks/worktree successfully receives remote peer worktree upload');
+  const uploadData = await uploadRes.json();
+  assert(uploadData.saved === true, 'Daemon successfully stored remote speculative worktree file');
+
+  // Step 5: At 10:48 (10 min later), Agent A finishes and releases lock
+  let promotedBReceived = false;
+  let worktreeBReconciled = false;
+  const onPromotedB = (info) => {
+    if (info.filePath === authRelPath && info.agentId === 'agent-B-1039') {
+      promotedBReceived = true;
+      if (info.worktreeResult && info.worktreeResult.merged && info.worktreeResult.verified) {
+        worktreeBReconciled = true;
+      }
+    }
+  };
+  lockRegistry.on('promoted', onPromotedB);
+
+  const releaseResA = lockRegistry.releaseLock(authRelPath, 'agent-A-1038');
+  assert(releaseResA.promotedTo === 'agent-B-1039', 'Agent B is promoted to lock holder upon Agent A release');
+  assert(promotedBReceived, 'LockRegistry emits promoted event for Agent B');
+  assert(worktreeBReconciled, 'Peacemaker successfully reconciles and verifies Agent B changes');
+
+  // Step 6: Verify final file in main workspace contains BOTH login and logout without loss
+  const finalDiskContent = fs.readFileSync(authFullPath, 'utf8');
+  assert(finalDiskContent.includes('login') && finalDiskContent.includes('logout'), 'Main workspace file contains BOTH login and logout functions');
+  assert(finalDiskContent.includes('authVersion') && finalDiskContent.includes('AUTH_TIMEOUT'), 'Main workspace retains original base symbols');
+
+  // Step 7: Strict Babel AST Semantic Audit on unified file
+  const finalAst = extractAstSymbols(finalDiskContent);
+  assert(!finalAst.parseError, 'Reconciled auth.js passes Babel AST parsing without syntax errors');
+  assert(finalAst.exports.has('login'), 'Babel AST confirms login is properly exported');
+  assert(finalAst.exports.has('logout'), 'Babel AST confirms logout is properly exported');
+  assert(finalAst.exports.has('authVersion'), 'Babel AST confirms authVersion is preserved');
+  assert(finalAst.declarations.has('login') && finalAst.declarations.has('logout'), 'Babel AST confirms both functions declared');
+
+  // Step 8: Fail-Safe Guard: If speculative worktree has invalid syntax, do not corrupt main file
+  const failSafeRel = 'test/fixtures/fail-safe.js';
+  const failSafeFull = path.join(TURF_ROOT, failSafeRel);
+  const goodCode = 'export function safeFunction() { return 123; }\n';
+  fs.writeFileSync(failSafeFull, goodCode, 'utf8');
+
+  lockRegistry.requestLock(failSafeRel, 'holder-agent', 'Dev1', 1);
+  const queuedBad = lockRegistry.requestLock(failSafeRel, 'bad-syntax-agent', 'Dev2', 1);
+  assert(queuedBad.status === 'conflict', 'Bad syntax agent enqueued on conflict');
+
+  // Write broken code into bad-syntax-agent worktree
+  const badSyntaxCode = 'export function broken() { {{{';
+  lockRegistry.saveWorktreeFile(failSafeRel, 'bad-syntax-agent', 'default', badSyntaxCode);
+
+  const releaseHolder = lockRegistry.releaseLock(failSafeRel, 'holder-agent');
+  assert(releaseHolder.promotedTo === 'bad-syntax-agent', 'Bad syntax agent promoted');
+
+  // Verify main file is UNTOUCHED because AST verification rejected corrupted code
+  const preservedCode = fs.readFileSync(failSafeFull, 'utf8');
+  assert(preservedCode === goodCode, 'Fail-safe: Main file is NOT corrupted when speculative worktree contains syntax errors');
+
+  // Step 9: Clean up temporary test files
+  lockRegistry.off('promoted', onPromotedB);
+  lockRegistry.releaseLock(authRelPath, 'agent-B-1039');
+  lockRegistry.releaseLock(failSafeRel, 'bad-syntax-agent');
+  try { fs.unlinkSync(authFullPath); } catch (e) {}
+  try { fs.unlinkSync(failSafeFull); } catch (e) {}
+  try { fs.rmdirSync(path.join(TURF_ROOT, 'test/fixtures')); } catch (e) {}
+
+  // 14. Adversarial Concurrency & Remote Network Peer Tests
+  console.log('\n--- Testing Adversarial Concurrency & Remote Peer Network Invariants ---');
+
+  // Test A: Remote PID Guard: Remote peer with foreign PID is NOT evicted by local OS process check
+  const remoteFile = 'test/fixtures/remote-peer.js';
+  const remoteReq = lockRegistry.requestLock(remoteFile, 'remote-laptop-agent', 'Alice-Remote', 1, 'TRF-CHAOS', 999999);
+  assert(remoteReq.status === 'granted', 'Remote peer acquired lock with remote PID');
+  // Trigger zombie eviction sweep
+  lockRegistry._evictZombies();
+  const lockStillAlive = lockRegistry.locks.has(lockRegistry._norm(remoteFile));
+  assert(lockStillAlive, 'Remote peer lock is NOT prematurely evicted by local host isProcessAlive() check');
+  lockRegistry.releaseLock(remoteFile, 'remote-laptop-agent');
+
+  // Test B: CRLF vs LF Line-Ending Normalization
+  const baseCrlf = 'function alpha() {\r\n  return 1;\r\n}\r\n\r\nfunction beta() {\r\n  return 2;\r\n}\r\n';
+  const aLf = 'function alpha() {\n  console.log("alpha");\n  return 1;\n}\n\nfunction beta() {\n  return 2;\n}\n';
+  const bCrlf = 'function alpha() {\r\n  return 1;\r\n}\r\n\r\nfunction beta() {\r\n  console.log("beta");\r\n  return 2;\r\n}\r\n';
+  const crlfMergeRes = gitMerge3Way(baseCrlf, aLf, bCrlf);
+  assert(crlfMergeRes.success === true, 'gitMerge3Way seamlessly merges Windows CRLF and POSIX LF without conflicts');
+  assert(crlfMergeRes.merged.includes('console.log("alpha")') && crlfMergeRes.merged.includes('console.log("beta")'), 'Merged result contains both alpha and beta modifications');
+
+  // Test C: Disconnected Queue Head Bypass
+  const ghostQueueFile = 'test/fixtures/ghost-bypass.js';
+  lockRegistry.requestLock(ghostQueueFile, 'holder-agent', 'Dev1', 1);
+  // Enqueue a CLI ghost agent
+  const cliGhostReq = lockRegistry.requestLock(ghostQueueFile, 'cli_agent_ghost', 'Dev2', 1);
+  assert(cliGhostReq.status === 'conflict', 'CLI agent enqueued');
+  // Enqueue a live agent behind it
+  const liveAgentReq = lockRegistry.requestLock(ghostQueueFile, 'live_agent_next', 'Dev3', 1);
+  assert(liveAgentReq.status === 'conflict', 'Live agent enqueued behind CLI ghost');
+
+  // Holder releases -> ghost must be pruned, live agent promoted immediately
+  const ghostBypassRelease = lockRegistry.releaseLock(ghostQueueFile, 'holder-agent');
+  assert(ghostBypassRelease.promotedTo === 'live_agent_next', 'Dead CLI ghost bypassed immediately; live agent promoted to lock holder');
+  lockRegistry.releaseLock(ghostQueueFile, 'live_agent_next');
+
+  // 15. Adversarial Multi-Language Coverage & Same-Function Collision
+  console.log('\n--- Testing Multi-Language Coverage & Same-Function Collision Reconciliation ---');
+
+  // Test A: Non-JS Language Verification
+  const jsonCode = '{\n  "name": "turfcode",\n  "version": "1.0.0"\n}\n';
+  const jsonVerify = verifyCode(jsonCode, '', '', 'config.json');
+  assert(jsonVerify.valid === true, 'verifyCode validates JSON files with JSON.parse without node --check crash');
+
+  const pyCode = 'def calculate_metrics(data):\n    return sum(data) / len(data)\n';
+  const pyVerify = verifyCode(pyCode, '', '', 'app.py');
+  assert(pyVerify.valid === true, 'verifyCode validates Python files without node --check crash');
+
+  const yamlCode = 'server:\n  port: 8080\n  host: 0.0.0.0\n';
+  const yamlVerify = verifyCode(yamlCode, '', '', 'config.yaml');
+  assert(yamlVerify.valid === true, 'verifyCode validates YAML files without node --check crash');
+
+  const mdCode = '# Turfcode Documentation\n\nReal-time collaborative engine for AI agents.\n';
+  const mdVerify = verifyCode(mdCode, '', '', 'README.md');
+  assert(mdVerify.valid === true, 'verifyCode validates Markdown files without node --check crash');
+
+  // Test B: Same-Function Collision Reconciliation (Both modify the body of login)
+  const baseFunc = 'export function login(user, pass) {\n    const account = findUser(user);\n    if (!account) return false;\n    return account.password === pass;\n}\n';
+  const aFunc = 'import { hashPassword, verifyHash } from "./crypto.js";\n\nexport function login(user, pass) {\n    const account = findUser(user);\n    if (!account) return false;\n    return verifyHash(pass, account.passwordHash);\n}\n';
+  const bFunc = 'import { checkRateLimit } from "./rate-limiter.js";\n\nexport function login(user, pass) {\n    if (!checkRateLimit(user)) {\n        throw new Error("Rate limit exceeded");\n    }\n    const account = findUser(user);\n    if (!account) return false;\n    return account.password === pass;\n}\n';
+
+  const mergedSameFunc = peacemakerMergeSync('src/auth.js', baseFunc, aFunc, bFunc);
+  assert(mergedSameFunc.includes('verifyHash') && mergedSameFunc.includes('checkRateLimit'), 'Peacemaker successfully merges statements inside the same function body');
+  const sameFuncVerify = verifyCode(mergedSameFunc, aFunc, bFunc, 'src/auth.js');
+  assert(sameFuncVerify.valid === true, 'Reconciled same-function collision passes 3-stage verification');
+
+  // Test C: Windows Path Sanitization (Leading slashes)
+  const normalizedSlash = lockRegistry._norm('/src/nested/file.js');
+  assert(!normalizedSlash.startsWith('/'), 'Leading slash stripped to prevent Windows drive-root escape');
+
   console.log('\n--- E2E Tests Complete ---');
+
   console.log(`Passed: ${passed}, Failed: ${failed}`);
 
   ws.close();

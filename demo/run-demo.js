@@ -89,7 +89,7 @@ async function runDemo() {
     console.log(conflictChunk ? "-> Git merge-file generated conflict." : "-> No conflict (unexpected!).");
 
     console.log("-> Peacemaker Engaged: Merging VIP Discount + Gift-Wrap Fee via Claude 3.5 Sonnet");
-    const mergedContent = await peacemakerMerge('demo/checkout.js', contentA, contentB);
+    const mergedContent = await peacemakerMerge('demo/checkout.js', baseContent, contentA, contentB);
     
     console.log("-> Running 3-Stage Verification...");
     const verifyResult = verifyCode(mergedContent, contentA, contentB);

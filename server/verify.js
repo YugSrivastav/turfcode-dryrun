@@ -97,7 +97,7 @@ export function extractAstSymbols(code) {
 /**
  * 3-Stage Verification Engine (Syntax, Regex Symbol Audit, Babel AST Semantic Audit)
  */
-export function verifyCode(mergedCode, agentAChange, agentBChange) {
+export function verifyCode(mergedCode, agentAChange, agentBChange, filePath = '') {
     const startTime = Date.now();
     const result = {
         valid: true,
@@ -112,6 +112,80 @@ export function verifyCode(mergedCode, agentAChange, agentBChange) {
         },
         durationMs: 0
     };
+
+    if (!mergedCode || typeof mergedCode !== 'string') {
+        result.valid = false;
+        result.errors.push('Empty or invalid code content');
+        return result;
+    }
+
+    // Detect non-JavaScript file types
+    const ext = filePath ? path.extname(filePath).toLowerCase() : '';
+    const isJson = ext === '.json' || (mergedCode.trim().startsWith('{') && mergedCode.trim().endsWith('}')) || (mergedCode.trim().startsWith('[') && mergedCode.trim().endsWith(']'));
+    const isMarkdown = ext === '.md' || ext === '.markdown' || (mergedCode.trim().startsWith('#') && !mergedCode.includes(';'));
+    const isYaml = ext === '.yaml' || ext === '.yml' || (!mergedCode.includes('{') && !mergedCode.includes(';') && /^[a-zA-Z0-9_-]+:\s*/m.test(mergedCode));
+    const isPython = ext === '.py' || (/def\s+[a-zA-Z_]\w*\s*\(|class\s+[a-zA-Z_]\w*[:\(]/.test(mergedCode) && !mergedCode.includes('function ') && !mergedCode.includes('const ') && !mergedCode.includes('let '));
+    const isOtherNonJs = ['.css', '.html', '.sh', '.go', '.rs'].includes(ext);
+
+    // Conflict marker guard for all files
+    if (mergedCode.includes('<<<<<<<') || mergedCode.includes('>>>>>>>')) {
+        result.valid = false;
+        result.errors.push('Merge conflict markers (<<<<<<< / >>>>>>>) detected in merged code');
+        result.durationMs = Date.now() - startTime;
+        return result;
+    }
+
+    if (isJson) {
+        try {
+            JSON.parse(mergedCode);
+            result.valid = true;
+            result.durationMs = Date.now() - startTime;
+            return result;
+        } catch (e) {
+            result.valid = false;
+            result.errors.push(`JSON Syntax Error: ${e.message}`);
+            result.durationMs = Date.now() - startTime;
+            return result;
+        }
+    }
+
+    if (isMarkdown || isYaml || isOtherNonJs) {
+        if (isYaml && /^\t+/m.test(mergedCode)) {
+            result.valid = false;
+            result.errors.push('YAML Syntax Error: Tabs are not allowed for indentation in YAML');
+            result.durationMs = Date.now() - startTime;
+            return result;
+        }
+        result.valid = true;
+        result.durationMs = Date.now() - startTime;
+        return result;
+    }
+
+    if (isPython) {
+        const extractPyFns = (code) => {
+            const fns = new Set();
+            if (!code || typeof code !== 'string') return fns;
+            const pyFnRegex = /def\s+([a-zA-Z_]\w*)\s*\(/g;
+            let m;
+            while ((m = pyFnRegex.exec(code)) !== null) {
+                fns.add(m[1]);
+            }
+            return fns;
+        };
+        const mergedPyFns = extractPyFns(mergedCode);
+        const reqPyFns = new Set([...extractPyFns(agentAChange), ...extractPyFns(agentBChange)]);
+        for (const fn of reqPyFns) {
+            if (!mergedPyFns.has(fn)) {
+                result.valid = false;
+                result.missingSymbols.push(fn);
+            }
+        }
+        if (result.missingSymbols.length > 0) {
+            result.errors.push(`Missing Python functions: ${result.missingSymbols.join(', ')}`);
+        }
+        result.durationMs = Date.now() - startTime;
+        return result;
+    }
 
     // Stage 1: Fast Syntax Check via node --check (< 80ms)
     const tempFile = path.join(os.tmpdir(), `turf_verify_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.js`);

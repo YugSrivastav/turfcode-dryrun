@@ -19,6 +19,12 @@ export default function QueuePanel({ queue }) {
                 <span className="text-slate-400">{q.user} @ {q.agent}</span>
                 <span className="px-1.5 py-0.5 bg-amber-500/20 text-amber-400 rounded border border-amber-500/30">{q.priority}</span>
               </div>
+              {q.estimatedWait ? (
+                <div className="text-xs text-slate-500 mt-1 flex items-center justify-between">
+                  <span>⏱️ Est. Wait: ~{q.estimatedWait}s</span>
+                  {q.rank && <span className="text-purple-400">Position #{q.rank}</span>}
+                </div>
+              ) : null}
             </div>
           ))
         )}
