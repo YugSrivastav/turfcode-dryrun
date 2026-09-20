@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import blessed from 'blessed';
 import { spawnHostDaemon, getLocalIp } from '../server/index.js';
 import { lockRegistry, isProcessAlive } from '../server/locks.js';
-import { buildFileTree, flattenFileTree, formatTreeNode, getProjectFiles, getTruncatedPath, calculateLayout, buildHeaderContent, buildFooterContent, buildCenterLabel } from '../server/tui.js';
+import { buildFileTree, flattenFileTree, formatTreeNode, autoExpandParents, getProjectFiles, getTruncatedPath, calculateLayout, buildHeaderContent, buildFooterContent, buildCenterLabel } from '../server/tui.js';
 import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
 import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, extractFileCandidates } from '../server/pty_manager.js';
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
@@ -228,6 +228,19 @@ async function runTests() {
   expanded.delete('server');
   const collapsedTree = flattenFileTree(tree, expanded);
   assert(!collapsedTree.some(n => n.relPath === 'server/tui.js'), 'server/tui.js hidden when server/ is collapsed');
+
+  // Test auto-expansion of parent directories for new/synced files
+  const testExpanded = new Set();
+  autoExpandParents('src/components/buttons/PrimaryButton.jsx', testExpanded);
+  assert(testExpanded.has('src'), 'autoExpandParents expands top-level parent');
+  assert(testExpanded.has('src/components'), 'autoExpandParents expands intermediate parent');
+  assert(testExpanded.has('src/components/buttons'), 'autoExpandParents expands deepest directory parent');
+  assert(!testExpanded.has('src/components/buttons/PrimaryButton.jsx'), 'autoExpandParents does not treat file itself as directory');
+
+  // Test Windows backslash and leading ./ handling
+  autoExpandParents('.\\server\\utils\\helpers.js', testExpanded);
+  assert(testExpanded.has('server'), 'autoExpandParents normalizes Windows path and leading dot');
+  assert(testExpanded.has('server/utils'), 'autoExpandParents adds normalized server/utils');
 
   // Test icon and formatting
   const serverNode = flattened.find(n => n.name === 'server');
@@ -838,6 +851,7 @@ async function runTests() {
   const classicLayout = calculateLayout(80, 24);
   assert(classicLayout.centerPane.width >= 38, 'Classic 80-col terminal guarantees at least 38 columns for center coding pane');
   assert(classicLayout.leftSidebar.width + classicLayout.centerPane.width + classicLayout.rightSidebar.width <= 80, 'Total panels width does not exceed terminal columns on 80x24');
+  assert(classicLayout.leftSidebar.hidden === false && classicLayout.leftSidebar.width > 0, 'Classic 80-col terminal keeps left sidebar visible when uncollapsed');
 
   // Small 100x30 laptop
   const laptop100Layout = calculateLayout(100, 30);

@@ -75,7 +75,7 @@ const TURF_ROOT = path.resolve(__dirname, '..');
 
 export function buildFileTree(dir, baseDir = dir, depth = 0, maxDepth = 6) {
   if (depth > maxDepth) return [];
-  const IGNORE = new Set(['.git', 'node_modules', 'dist', 'build', '.gemini', '.turbo', '.system_generated', '.next', 'coverage', '.cache']);
+  const IGNORE = new Set(['.git', 'node_modules', 'dist', 'build', '.gemini', '.turbo', '.system_generated', '.next', 'coverage', '.cache', '.turf', 'turf-error.log', 'turf-sync.tar.gz', 'turf-worktrees', '.turf-worktrees']);
   const items = [];
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -126,6 +126,17 @@ export function flattenFileTree(nodes, expandedDirs, depth = 0, parentRel = null
   return list;
 }
 
+export function autoExpandParents(relPath, expandedDirs) {
+  if (!relPath || !expandedDirs) return;
+  const normalized = path.normalize(relPath).replace(/\\/g, '/').replace(/^\.\//, '');
+  const parts = normalized.split('/');
+  let current = '';
+  for (let i = 0; i < parts.length - 1; i++) {
+    current = current ? `${current}/${parts[i]}` : parts[i];
+    expandedDirs.add(current);
+  }
+}
+
 function truncateString(str, maxW) {
   if (!str) return '';
   let w = 0;
@@ -174,8 +185,13 @@ export function calculateLayout(cols = 100, rows = 30, leftCollapsed = false, ri
     leftW = leftCollapsed ? 0 : 20;
     rightW = rightCollapsed ? 0 : 24;
     if (cols - leftW - rightW < minCenterW) {
-      leftW = 0;
-      if (cols - rightW < minCenterW) {
+      if (!leftCollapsed && !rightCollapsed) {
+        const avail = Math.max(0, cols - minCenterW);
+        leftW = Math.max(16, Math.floor(avail * 0.44));
+        rightW = Math.max(18, avail - leftW);
+      } else if (!leftCollapsed) {
+        leftW = Math.max(0, cols - minCenterW);
+      } else if (!rightCollapsed) {
         rightW = Math.max(0, cols - minCenterW);
       }
     }
@@ -506,7 +522,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   }
   updateHeader();
 
-  let isLeftSidebarCollapsed = (screen.width || 100) < 95;
+  let isLeftSidebarCollapsed = (screen.width || 100) < 75;
   let isRightSidebarCollapsed = false;
 
   const initLayout = calculateLayout(screen.width || 100, screen.height || 30, isLeftSidebarCollapsed, isRightSidebarCollapsed);
@@ -990,6 +1006,15 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   let expandedDirs = new Set();
   let isTreeInitialized = false;
 
+  function autoExpandAllTopLevel() {
+    fileTreeData = buildFileTree(currentDir, currentDir);
+    for (const item of fileTreeData) {
+      if (item.isDir) {
+        expandedDirs.add(item.relPath);
+      }
+    }
+  }
+
   function refreshFileList(preserveSelection = true, maxInnerW) {
     const innerW = maxInnerW || Math.max(12, ((leftSidebar && leftSidebar.width) || 28) - 3);
     const prevSelectedRel = (visibleFileList && visibleFileList[filesList.selected]) 
@@ -1007,6 +1032,13 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         }
       }
       isTreeInitialized = true;
+    } else {
+      // Auto-expand any newly discovered top-level directories
+      for (const item of fileTreeData) {
+        if (item.isDir && !item.relPath.includes('/')) {
+          expandedDirs.add(item.relPath);
+        }
+      }
     }
 
     visibleFileList = flattenFileTree(fileTreeData, expandedDirs);
@@ -1092,6 +1124,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
 
   function printWelcomeBanner() {
     termLog.log(`{bold}{149-fg}TURFCODE SHELL{/149-fg}{/bold} {grey-fg}│ Run terminal commands or type /turf, /cmdc, /codex to start AI agents{/grey-fg}`);
+    termLog.log(`{grey-fg}📁 Workspace: {yellow-fg}${currentDir}{/yellow-fg} (${isPeer ? 'Peer Local Copy' : 'Host Project Root'}){/grey-fg}`);
     cmdcLog.log(`{bold}{magenta-fg}COMMAND CODE AGENT{/magenta-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     codexLog.log(`{bold}{cyan-fg}OPENAI CODEX AGENT{/cyan-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     turfLog.log(`{bold}{green-fg}TURF AGENT{/green-fg}{/bold} {grey-fg}│ Turf-native intent locks ON │ /plan for read-only recon{/grey-fg}`);
@@ -1140,6 +1173,8 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     { cmd: '/term', desc: 'Switch to Shell terminal or run command (/term <command>)' },
     { cmd: '/chat', desc: 'Send message to team chat or focus chat (/chat <msg>)' },
     { cmd: '/files', desc: 'Focus workspace file explorer [F3]' },
+    { cmd: '/refresh', desc: 'Rescan and refresh workspace file tree' },
+    { cmd: '/pwd', desc: 'Display active workspace root directory path' },
     { cmd: '/sidebar', desc: 'Toggle left or right sidebar (/sidebar left | right)' },
     { cmd: '/web', desc: 'Open collaborative web preview browser [Ctrl+O]' },
     { cmd: '/help', desc: 'Show full command documentation and shortcuts' }
@@ -1628,10 +1663,10 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         }
       } else if (data.type === 'file:sync') {
         if (data.origin && data.origin !== hostName && data.relPath && typeof data.content === 'string') {
-          const normRel = path.normalize(data.relPath).replace(/\\/g, '/');
+          const normRel = path.normalize(data.relPath).replace(/\\/g, '/').replace(/^\.\//, '');
           // Check if local user holds an active lock on this file
           const isHeldLocally = currentLocks.some(l => {
-            const lFile = path.normalize(l.filePath || l.file || '').replace(/\\/g, '/');
+            const lFile = path.normalize(l.filePath || l.file || '').replace(/\\/g, '/').replace(/^\.\//, '');
             return (lFile === normRel || normRel.endsWith(lFile)) && (l.agentId === hostName || l.user === hostName);
           });
           if (isHeldLocally) {
@@ -1643,8 +1678,13 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
               const fullTarget = path.join(currentDir, normRel);
               fs.mkdirSync(path.dirname(fullTarget), { recursive: true });
               fs.writeFileSync(fullTarget, data.content, 'utf8');
+              autoExpandParents(normRel, expandedDirs);
               refreshFileList(true);
               chatLogBox.log(` {cyan-fg}⚡ [SYNC]{/cyan-fg} {white-fg}${normRel}{/white-fg} {grey-fg}(from ${data.origin}){/grey-fg}`);
+              getActiveLog().log(`{cyan-fg}⚡ [SYNC]{/cyan-fg} {yellow-fg}${normRel}{/yellow-fg} {grey-fg}replicated from ${data.origin}{/grey-fg}`);
+              if (activeCenterTab === 'file' && currentOpenedFile === normRel) {
+                openFileInViewer(normRel);
+              }
               screen.render();
             } catch (err) {}
           }
@@ -1657,46 +1697,57 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   const debounceTimers = new Map();
   const IGNORE_SYNC = new Set(['.git', 'node_modules', '.turf', 'dist', '.env', 'turf-error.log', 'turf-sync.tar.gz', '.gemini', '.turbo', '.cache', 'turf-worktrees', '.turf-worktrees']);
 
-  // Native debounced file watcher for real-time peer replication
-  try {
-    const fileWatcher = fs.watch(currentDir, { recursive: true }, (eventType, filename) => {
-      if (!filename) return;
-      const normalizedRel = filename.replace(/\\/g, '/');
-      const parts = normalizedRel.split('/');
-      if (parts.some(p => IGNORE_SYNC.has(p) || p.startsWith('.'))) return;
-
-      const suppressionExpiry = syncSuppressionMap.get(normalizedRel);
-      if (suppressionExpiry && Date.now() < suppressionExpiry) return;
-
-      if (debounceTimers.has(normalizedRel)) {
-        clearTimeout(debounceTimers.get(normalizedRel));
-      }
-
-      debounceTimers.set(normalizedRel, setTimeout(() => {
-        debounceTimers.delete(normalizedRel);
-        try {
+  let fileWatcher = null;
+  function setupFileWatcher() {
+    if (fileWatcher) {
+      try { fileWatcher.close(); } catch (e) {}
+      fileWatcher = null;
+    }
+    try {
+      fileWatcher = fs.watch(currentDir, { recursive: true }, (eventType, filename) => {
+        if (!filename) {
           refreshFileList(true);
-          const fullPath = path.join(currentDir, normalizedRel);
-          if (fs.existsSync(fullPath)) {
-            const stat = fs.statSync(fullPath);
-            if (stat.isFile() && stat.size < 500000) {
-              const content = fs.readFileSync(fullPath, 'utf8');
-              if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                  type: 'file:sync',
-                  origin: hostName,
-                  relPath: normalizedRel,
-                  content
-                }));
+          return;
+        }
+        const cleanRel = path.normalize(filename).replace(/\\/g, '/').replace(/^\.\//, '');
+        const parts = cleanRel.split('/');
+        if (parts.some(p => IGNORE_SYNC.has(p) || p === '.' || p === '..')) return;
+
+        const suppressionExpiry = syncSuppressionMap.get(cleanRel);
+        if (suppressionExpiry && Date.now() < suppressionExpiry) return;
+
+        if (debounceTimers.has(cleanRel)) {
+          clearTimeout(debounceTimers.get(cleanRel));
+        }
+
+        debounceTimers.set(cleanRel, setTimeout(() => {
+          debounceTimers.delete(cleanRel);
+          try {
+            autoExpandParents(cleanRel, expandedDirs);
+            refreshFileList(true);
+            const fullPath = path.join(currentDir, cleanRel);
+            if (fs.existsSync(fullPath)) {
+              const stat = fs.statSync(fullPath);
+              if (stat.isFile() && stat.size < 52428800) {
+                const content = fs.readFileSync(fullPath, 'utf8');
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'file:sync',
+                    origin: hostName,
+                    relPath: cleanRel,
+                    content
+                  }));
+                }
               }
             }
-          }
-        } catch (e) {}
-      }, 300));
-    });
+          } catch (e) {}
+        }, 300));
+      });
 
-    if (fileWatcher.unref) fileWatcher.unref();
-  } catch (e) {}
+      if (fileWatcher.unref) fileWatcher.unref();
+    } catch (e) {}
+  }
+  setupFileWatcher();
 
   // 5-Second periodic file tree refresh to catch newly created/synced files
   const fileRefreshTimer = setInterval(() => {
@@ -1788,6 +1839,10 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
   }
 
   function focusFiles() {
+    if (isLeftSidebarCollapsed || (leftSidebar && leftSidebar.hidden)) {
+      isLeftSidebarCollapsed = false;
+      applyLayout();
+    }
     focusIndex = 2;
     hideCommandPalette();
     updateFocusStyles();
@@ -2528,6 +2583,8 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/turf, /cmdc, /codex, /term{/bold} Switch tab or run targeted command`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/plan{/bold}                Toggle read-only recon plan mode`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/chat <msg>{/bold}          Send team chat message or focus chat`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/refresh, /reload{/bold}   Rescan & refresh workspace file tree`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/pwd, /where{/bold}         Show active workspace root directory path`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sidebar <left|right>{/bold} Toggle left or right sidebar (or Ctrl+B / Ctrl+E)`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
       currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
@@ -2694,6 +2751,24 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       return;
     }
 
+    if (inputStr === '/refresh' || inputStr === '/rescan' || inputStr === '/reload') {
+      autoExpandAllTopLevel();
+      refreshFileList(false);
+      currentLog.log(`{green-fg}✓ Workspace files refreshed ({bold}${visibleFileList.length}{/bold} items visible){/green-fg}`);
+      currentLog.log(`{grey-fg}Workspace: ${currentDir}{/grey-fg}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/pwd' || inputStr === '/where') {
+      currentLog.log(`{cyan-fg}Active workspace directory ({bold}${isPeer ? 'Peer Local Copy' : 'Host Project Root'}{/bold}):{/cyan-fg}`);
+      currentLog.log(`{yellow-fg}${currentDir}{/yellow-fg}`);
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
     if (inputStr === '/demo') {
       runDemo();
       terminalInput.clearValue();
@@ -2721,6 +2796,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       updateCenterLabel();
       currentLog.log(`{cyan-fg}Directory changed to:{/cyan-fg} {yellow-fg}${currentDir}{/yellow-fg}`);
       refreshFileList(false);
+      setupFileWatcher();
       terminalInput.clearValue();
       focusTerminal();
       return;
