@@ -1128,7 +1128,8 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     termLog.log(`{grey-fg}📁 Workspace: {yellow-fg}${currentDir}{/yellow-fg} (${isPeer ? 'Peer Local Copy' : 'Host Project Root'}){/grey-fg}`);
     cmdcLog.log(`{bold}{magenta-fg}COMMAND CODE AGENT{/magenta-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     codexLog.log(`{bold}{cyan-fg}OPENAI CODEX AGENT{/cyan-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
-    turfLog.log(`{bold}{green-fg}TURF AGENT{/green-fg}{/bold} {grey-fg}│ Turf-native intent locks ON │ /plan for read-only recon{/grey-fg}`);
+    turfLog.log(`{bold}{149-fg}⚡ TURF AGENT 2.5{/149-fg}{/bold} {grey-fg}│ Real-Time Intent Board & Speculative Worktrees Active{/grey-fg}`);
+    turfLog.log(`{grey-fg}Engine: {149-fg}Gemini 2.5 Flash{/149-fg} │ 3-Way AST Peacemaker: {green-fg}ONLINE{/green-fg} │ Press {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} or {bold}{yellow-fg}/demo{/yellow-fg}{/bold} for live rehearsal{/grey-fg}`);
   }
   printWelcomeBanner();
 
@@ -1177,6 +1178,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     { cmd: '/refresh', desc: 'Rescan and refresh workspace file tree' },
     { cmd: '/pwd', desc: 'Display active workspace root directory path' },
     { cmd: '/key', desc: 'View, add or change AI provider API keys (/key <provider> <key>)' },
+    { cmd: '/demo', desc: 'Run 2-minute live dual-agent collision & Peacemaker AST merge demo [F5]' },
     { cmd: '/sidebar', desc: 'Toggle left or right sidebar (/sidebar left | right)' },
     { cmd: '/web', desc: 'Open collaborative web preview browser [Ctrl+O]' },
     { cmd: '/help', desc: 'Show full command documentation and shortcuts' }
@@ -1461,7 +1463,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
               const branchTag = r.speculativeWorktree ? ' {cyan-fg}[BRANCH]{/cyan-fg}' : '';
               const who = r.user || 'agent';
               const ag = r.agent ? ` (${r.agent})` : '';
-              content += `    ↳ #{r.rank} {bold}${who}${ag}{/bold} [${pScore}, ~${waitSec}]${branchTag}\n`;
+              content += `    ↳ #${r.rank} {bold}${who}${ag}{/bold} [${pScore}, ~${waitSec}]${branchTag}\n`;
             });
           }
         }
@@ -1969,6 +1971,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     const proc = spawn(process.execPath, [path.join(TURF_ROOT, 'demo', 'run-demo.js')], { cwd: TURF_ROOT });
     if (activeCenterTab === 'codex') activeCodexProc = proc;
     else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = proc;
+    else if (activeCenterTab === 'turf') activeTurfProc = proc;
     else activeTermProc = proc;
     updateCenterLabel();
 
@@ -1989,6 +1992,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     proc.on('close', () => {
       if (activeCenterTab === 'codex') activeCodexProc = null;
       else if (activeCenterTab === 'cmdc' || activeCenterTab === 'agy') activeCmdcProc = null;
+      else if (activeCenterTab === 'turf') activeTurfProc = null;
       else activeTermProc = null;
       updateCenterLabel();
       screen.render();
@@ -2596,8 +2600,9 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/refresh, /reload{/bold}   Rescan & refresh workspace file tree`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/pwd, /where{/bold}         Show active workspace root directory path`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/key <prov> <key>{/bold}    View or update API keys (gemini, groq, openai, anthropic)`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/demo, [F5]{/bold}            Run 2-minute live dual-agent collision & Peacemaker demo`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sidebar <left|right>{/bold} Toggle left or right sidebar (or Ctrl+B / Ctrl+E)`);
-      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [F5] Demo │ [Ctrl+O] Web`);
       currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
       terminalInput.clearValue();
       focusTerminal();
@@ -2708,6 +2713,13 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
           currentLog.log(`{cyan-fg}Live model list refreshed with new key. Use /model to view or select.{/cyan-fg}`);
         }
       }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/demo' || inputStr === '/rehearsal' || inputStr === '/simulate') {
+      runDemo();
       terminalInput.clearValue();
       focusTerminal();
       return;

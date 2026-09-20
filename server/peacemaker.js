@@ -379,6 +379,12 @@ export async function peacemakerMerge(filePath, baseCode, agentAChange, agentBCh
     agentAChange = baseCode;
     baseCode = '';
   }
+
+  const dominantEol = detectLineEnding(agentAChange || agentBChange || baseCode);
+  const normA = normalizeLineEndings(agentAChange);
+  const normB = normalizeLineEndings(agentBChange);
+  const normBase = normalizeLineEndings(baseCode);
+
   // 1. Try 3-way git line merge first
   const git3way = gitMerge3Way(baseCode, agentAChange, agentBChange);
   if (git3way.success) {

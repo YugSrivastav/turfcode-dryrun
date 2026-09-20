@@ -52,5 +52,25 @@ if (!args.includes('--thinking') && !args.some(a => a.startsWith('--thinking='))
   args.push('--thinking', 'off');
 }
 
+// Ensure non-interactive execution flag (-p) when prompt or --mode is provided
+// Without -p, Pi blocks waiting for interactive TTY stdin.
+const hasPrint = args.includes('-p') || args.includes('--print');
+const isModeJson = args.includes('--mode') && args[args.indexOf('--mode') + 1] === 'json';
+const hasPositionalPrompt = args.some(a => !a.startsWith('-'));
+
+if (!hasPrint && (isModeJson || hasPositionalPrompt)) {
+  args.unshift('-p');
+}
+
+// Auto-configure provider if not explicitly given
+if (!args.includes('--provider') && !args.some(a => a.startsWith('--provider='))) {
+  if (env.GEMINI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
+    args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+  } else if (env.GROQ_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
+    args.push('--provider', 'groq', '--model', 'llama-3.3-70b-versatile');
+  }
+}
+
 const res = spawnSync(process.execPath, [PI_CLI, ...args], { stdio: 'inherit', env });
 process.exit(res.status ?? 1);
+

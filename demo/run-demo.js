@@ -22,7 +22,7 @@ async function runDemo() {
         execSync('git commit -m "Initial commit"');
     } catch(e) {}
 
-    console.log("\\n[Act 1: The Parallel Sprint (0:00 – 0:30)]");
+    console.log("\n[Act 1: The Parallel Sprint (0:00 – 0:30)]");
     console.log("Yug (Agent A) prompts: 'Add a 15% VIP discount logic to checkout.js'");
     const agentAWorktree = createWorktree(repoPath, roomCode, 'AgentA');
     
@@ -44,7 +44,7 @@ async function runDemo() {
     } catch(e) {}
     console.log("-> Agent A finished and committed to speculative worktree turf/AgentA");
 
-    console.log("\\n[Act 2: The Collision (0:30 – 0:50)]");
+    console.log("\n[Act 2: The Collision (0:30 – 0:50)]");
     console.log("Ayush (Agent B) prompts: 'Add a $5 flat gift-wrap fee to checkout.js'");
     const agentBWorktree = createWorktree(repoPath, roomCode, 'AgentB');
     
@@ -66,7 +66,7 @@ async function runDemo() {
     } catch(e) {}
     console.log("-> ⚠️ COLLISION DETECTED on checkout.js. Forked Ayush to speculative worktree turf/AgentB");
 
-    console.log("\\n[Act 3: The Peacemaker Miracle (0:50 – 1:20)]");
+    console.log("\n[Act 3: The Peacemaker Miracle (0:50 – 1:20)]");
     console.log("-> Extracting 3-way conflict chunk...");
     
     // Just to simulate extraction

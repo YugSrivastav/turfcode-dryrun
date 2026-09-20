@@ -258,13 +258,13 @@ export function parseTurfJsonLine(line, config, emit) {
     const clean = line.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').trim();
     if (!clean || clean.startsWith('[?') || clean.startsWith('npm exec')) return;
 
-    // Check for 401 authentication error line e.g. `401 {"type":"error",...}`
-    if (clean.includes('401') || clean.includes('authentication_error') || clean.includes('invalid x-api-key') || clean.includes('invalid_api_key')) {
+    // Check for authentication error line e.g. `401 {"type":"error",...}` or `API key not valid`
+    if (clean.includes('401') || clean.includes('authentication_error') || clean.includes('invalid x-api-key') || clean.includes('invalid_api_key') || clean.includes('API key not valid') || clean.includes('API_KEY_INVALID')) {
       config.lastTurnFailed = true;
       emit('agent:msg', {
         tabId: 'turf',
         type: 'error',
-        text: `{bold}{red-fg}❌ Turf Authentication Error (401): Missing or invalid API key.{/red-fg}{/bold}\n{yellow-fg}💡 Tip: Add GEMINI_API_KEY, GROQ_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY to your .env or environment.{/yellow-fg}`
+        text: `{bold}{red-fg}❌ Turf Authentication Error: Missing or invalid API key.{/red-fg}{/bold}\n{yellow-fg}💡 Tip: Use /key gemini <your-key> to configure API key, or press [F5] / type /demo for live rehearsal.{/yellow-fg}`
       });
       emit('status', { tabId: 'turf', status: 'idle', details: 'Auth Error' });
       return;
@@ -319,11 +319,19 @@ export function parseTurfJsonLine(line, config, emit) {
     } else if (data.message.errorMessage) {
       config.lastTurnFailed = true;
       const errStr = String(data.message.errorMessage);
+      let friendlyError = '';
       let advice = '';
-      if (errStr.includes('429') || errStr.toLowerCase().includes('rate limit')) {
+
+      if (errStr.includes('API key not valid') || errStr.includes('API_KEY_INVALID') || errStr.includes('401') || errStr.includes('authentication_error')) {
+        friendlyError = 'Invalid or missing API key.';
+        advice = '\n{yellow-fg}💡 Quick Fix: Use /key gemini <your-key> to set key, or press [F5] / type /demo for automated rehearsal.{/yellow-fg}';
+      } else if (errStr.includes('429') || errStr.toLowerCase().includes('rate limit')) {
+        friendlyError = 'Rate limit (429) reached on current provider.';
         advice = '\n{yellow-fg}💡 Tip: Free Groq keys have a 20,000 TPM limit. Switch to Google Gemini Studio for 1,000,000 TPM limit.{/yellow-fg}';
+      } else {
+        friendlyError = errStr.slice(0, 300);
       }
-      emit('agent:msg', { tabId: 'turf', type: 'error', text: `{bold}{red-fg}❌ Turf Error: ${safeEscape(errStr.slice(0, 300))}{/red-fg}{/bold}${advice}` });
+      emit('agent:msg', { tabId: 'turf', type: 'error', text: `{bold}{red-fg}❌ Turf Error: ${safeEscape(friendlyError)}{/red-fg}{/bold}${advice}` });
       emit('status', { tabId: 'turf', status: 'idle', details: 'Error' });
     }
     config.hasStreamedResponse = false;
@@ -656,9 +664,9 @@ export class PtyManager extends EventEmitter {
       const config = this.getAgentConfig('turf');
 
 
-      // Pi-native flags: --mode json event stream, -c/--session resume,
+      // Pi-native flags: --mode json event stream, -p non-interactive, -c/--session resume,
       // --thinking effort, --tools allowlist as the read-only/plan gate.
-      args = [...resolved.prefix, '--mode', 'json'];
+      args = [...resolved.prefix, '--mode', 'json', '-p'];
       if (config.sessionId) {
         args.push('--session', config.sessionId);
       } else if (config.turnCount > 0) {

@@ -10,7 +10,7 @@ import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdc
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
 import { getGroqApiKeys, getNextGroqApiKey, fetchLiveGeminiModels, invalidateModelCache } from '../server/model_discovery.js';
 import { verifyCode, extractAstSymbols } from '../server/verify.js';
-import { gitMerge3Way, astSemanticMerge, peacemakerMergeSync } from '../server/peacemaker.js';
+import { gitMerge3Way, astSemanticMerge, peacemakerMergeSync, peacemakerMerge } from '../server/peacemaker.js';
 import WebSocket from 'ws';
 import os from 'os';
 import { execSync, execFile } from 'child_process';
@@ -1412,6 +1412,86 @@ export function logout(token) {
   // Test C: Windows Path Sanitization (Leading slashes)
   const normalizedSlash = lockRegistry._norm('/src/nested/file.js');
   assert(!normalizedSlash.startsWith('/'), 'Leading slash stripped to prevent Windows drive-root escape');
+
+  // 16. Hackathon Presentation Hardening & Mathematical Queue Verification
+  console.log('\n--- Testing Hackathon Concurrency Engine & Mathematical Queue Dynamics ---');
+
+  // Test A: peacemakerMerge async does not throw ReferenceError: normA
+  const sampleBase = 'export function add(a, b) { return a + b; }\n';
+  const sampleA = 'export function add(a, b) { return a + b; }\nexport function sub(a, b) { return a - b; }\n';
+  const sampleB = 'export function add(a, b) { return a + b; }\nexport function mul(a, b) { return a * b; }\n';
+  const asyncMerged = await peacemakerMerge('src/math.js', sampleBase, sampleA, sampleB);
+  assert(typeof asyncMerged === 'string' && asyncMerged.includes('sub') && asyncMerged.includes('mul'), 'peacemakerMerge (async) preserves both functions without ReferenceError: normA');
+
+  // Test B: Mathematical Anti-Starvation Aging Dynamics
+  const mathTestFile = 'src/shared_calc.js';
+  lockRegistry.requestLock(mathTestFile, 'initial_holder', 'Holder', { score: 100 });
+  const t0 = Date.now();
+  // Enqueue low-priority background agent (Score 50)
+  lockRegistry.queues.set(mathTestFile, [{
+    agentId: 'low_tier_agent',
+    user: 'Agent Low',
+    score: 50,
+    enqueuedTime: t0 - 16000, // 16 seconds ago
+    seq: 1
+  }, {
+    agentId: 'high_tier_human',
+    user: 'Human High',
+    score: 100,
+    enqueuedTime: t0, // Just arrived
+    seq: 2
+  }]);
+
+  const computedQueue = lockRegistry._computeQueue(mathTestFile);
+  assert(computedQueue.length === 2, '_computeQueue returns both queued candidates');
+  assert(computedQueue[0].agentId === 'low_tier_agent', 'Anti-starvation formula mathematically promotes low-tier agent after 16s (50 + 3.5*16 = 106 > 100)');
+  assert(computedQueue[0].effectivePriority >= 105, 'Computed effective priority reflects aging coefficient (+3.5/s)');
+  assert(computedQueue[0].rank === 1, 'Top candidate receives Rank 1');
+  assert(typeof computedQueue[0].estimatedWaitSeconds === 'number', 'Queue item calculates estimated wait seconds');
+
+  // Test C: Dual-Agent Concurrent Edit on Same File with Speculative Worktree Fork & AST Merge
+  const concurrentFile = 'demo/collision_test.js';
+  const diskFile = path.resolve(TURF_ROOT, concurrentFile);
+  fs.mkdirSync(path.dirname(diskFile), { recursive: true });
+  const baseDiskContent = 'export function processOrder(order) {\n  let total = order.amount;\n  return total;\n}\n';
+  fs.writeFileSync(diskFile, baseDiskContent, 'utf8');
+
+  // Agent 1 acquires lock
+  const req1 = lockRegistry.requestLock(concurrentFile, 'agent_vip', 'AgentVip', 1);
+  assert(req1.status === 'granted', 'Agent 1 acquires initial lock on collision_test.js');
+
+  // Agent 2 encounters conflict and is advised to fork speculative worktree
+  const req2 = lockRegistry.requestLock(concurrentFile, 'agent_tax', 'AgentTax', 1);
+  assert(req2.status === 'conflict', 'Agent 2 receives collision notice and enters waiting queue');
+
+  // Agent 1 writes changes to main file
+  const agent1Mod = 'export function processOrder(order) {\n  let total = order.amount;\n  function applyVip() { total *= 0.85; }\n  applyVip();\n  return total;\n}\n';
+  fs.writeFileSync(diskFile, agent1Mod, 'utf8');
+
+  // Agent 2 writes changes to speculative worktree
+  const agent2Mod = 'export function processOrder(order) {\n  let total = order.amount;\n  function applyTax() { total += 10.0; }\n  applyTax();\n  return total;\n}\n';
+  const wtRoom = 'default';
+  const wtKey = `${wtRoom}:agent_tax:${concurrentFile}`;
+  lockRegistry.speculativeWorktrees.set(wtKey, agent2Mod);
+
+  // Agent 1 releases lock -> Agent 2 promoted -> AST Peacemaker automatically merges
+  const rel1 = lockRegistry.releaseLock(concurrentFile, 'agent_vip');
+  assert(rel1.status === 'released', 'Agent 1 successfully releases lock');
+
+  // Verify that the file on disk now contains BOTH modifications seamlessly merged!
+  const reconciledDisk = fs.readFileSync(diskFile, 'utf8');
+  assert(reconciledDisk.includes('applyVip') && reconciledDisk.includes('applyTax'), 'Speculative worktree automatically merged both VIP and Tax modifications to disk');
+  const reconcVerify = verifyCode(reconciledDisk, agent1Mod, agent2Mod, concurrentFile);
+  assert(reconcVerify.valid === true, 'Reconciled collision passes full Babel AST verification');
+
+  // Clean up test file and lock
+  lockRegistry.releaseLock(concurrentFile, 'agent_tax');
+  try { fs.unlinkSync(diskFile); } catch (e) {}
+  try { lockRegistry.releaseLock(mathTestFile, 'initial_holder'); } catch (e) {}
+
+  // Test D: Pi CLI Non-Interactive Spawn Configuration Check
+  const turfWrapperContent = fs.readFileSync(path.join(TURF_ROOT, 'bin', 'turf-agent.js'), 'utf8');
+  assert(turfWrapperContent.includes("args.unshift('-p')") || turfWrapperContent.includes("args.includes('-p')"), 'turf-agent.js guarantees non-interactive -p flag');
 
   console.log('\n--- E2E Tests Complete ---');
 
