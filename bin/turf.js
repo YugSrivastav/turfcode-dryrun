@@ -487,7 +487,7 @@ async function main() {
     }
     let detectedRoomCode = 'SYNC';
     try {
-      const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(3000) });
+      const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(5000) });
       if (roomRes.ok) {
         const meta = await roomRes.json();
         if (meta && meta.code) detectedRoomCode = meta.code;
@@ -495,8 +495,13 @@ async function main() {
     } catch (e) {}
     let peerRepoPath = path.join(os.homedir(), '.turf', 'rooms', detectedRoomCode, 'repo');
     try {
-      await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath);
+      await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath, (received, total) => {
+        const mb = (received / 1024 / 1024).toFixed(1);
+        process.stdout.write(`\rDownloading workspace: ${mb} MB...`);
+      });
+      process.stdout.write('\n');
     } catch (e) {
+      console.error(`\n❌ Could not synchronize workspace from host (${e.message}).`);
       peerRepoPath = process.cwd();
     }
     cleanupStdinForBlessed();
@@ -565,22 +570,73 @@ async function main() {
       const keyRes = await setupTurfApiKey((q) => prompt(q), pad, process.cwd());
       if (keyRes === '__BACK__') continue;
       
-      console.log('\n' + pad + accent('●') + ' ' + dim(`Synchronizing repository from ${hostIp}:${targetPort}...`));
-      let detectedRoomCode = 'SYNC';
-      try {
-        const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(3000) });
-        if (roomRes.ok) {
-          const meta = await roomRes.json();
-          if (meta && meta.code) detectedRoomCode = meta.code;
+      let syncSuccess = false;
+      let peerRepoPath = '';
+
+      while (!syncSuccess) {
+        console.log('\n' + pad + accent('●') + ' ' + dim(`Connecting and synchronizing repository from ${hostIp}:${targetPort}...`));
+        let detectedRoomCode = 'SYNC';
+        try {
+          const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(5000) });
+          if (roomRes.ok) {
+            const meta = await roomRes.json();
+            if (meta && meta.code) detectedRoomCode = meta.code;
+          }
+        } catch (e) {}
+
+        peerRepoPath = path.join(os.homedir(), '.turf', 'rooms', detectedRoomCode, 'repo');
+
+        let lastProgressLine = '';
+        const onProgress = (received, total) => {
+          const mbReceived = (received / 1024 / 1024).toFixed(1);
+          let progressStr = '';
+          if (total > 0) {
+            const mbTotal = (total / 1024 / 1024).toFixed(1);
+            const pct = Math.min(100, Math.floor((received / total) * 100));
+            const barWidth = 20;
+            const filled = Math.floor((pct / 100) * barWidth);
+            const bar = '█'.repeat(filled) + '░'.repeat(barWidth - filled);
+            progressStr = `[${bar}] ${pct}% (${mbReceived} MB / ${mbTotal} MB)`;
+          } else {
+            progressStr = `(${mbReceived} MB received)`;
+          }
+          lastProgressLine = pad + accent('↓') + ' ' + bright('Downloading workspace: ') + dim(progressStr);
+          process.stdout.write(`\r${lastProgressLine}`);
+        };
+
+        try {
+          const files = await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath, onProgress);
+          if (lastProgressLine) process.stdout.write('\n');
+          console.log(pad + accent('✓') + ' ' + dim(`Workspace synchronized (${files.length} files) at ${peerRepoPath}`));
+          syncSuccess = true;
+        } catch (err) {
+          if (lastProgressLine) process.stdout.write('\n');
+          console.log('\n' + pad + chalk.red('❌ Workspace sync failed:') + ' ' + dim(err.message));
+          console.log(pad + bright('Options:'));
+          console.log(pad + '  ' + brandTurf('[1]') + ' Retry download from host');
+          console.log(pad + '  ' + brandTurf('[2]') + ' Select existing local folder/clone on your PC');
+          console.log(pad + '  ' + brandTurf('[3]') + ' Cancel / Back');
+
+          const failChoice = await prompt(pad + accent('›') + ' ' + bright('Action') + dim(' [1/2/3]: '));
+          if (failChoice === '__BACK__' || failChoice === '3') {
+            break;
+          }
+          if (failChoice === '2') {
+            const customPathInput = await prompt(pad + accent('›') + ' ' + bright('Path to local project/repo') + ' ' + dim('[default: .]: '));
+            if (customPathInput === '__BACK__') break;
+            const chosenPath = await normalizeAndValidatePath(customPathInput, (q) => prompt(q), pad);
+            if (chosenPath === '__BACK__') break;
+            peerRepoPath = chosenPath;
+            syncSuccess = true;
+          }
+          // Option 1 loops and retries download
         }
-      } catch (e) {}
-      let peerRepoPath = path.join(os.homedir(), '.turf', 'rooms', detectedRoomCode, 'repo');
-      try {
-        await syncWorkspaceFromHost(hostIp, targetPort, peerRepoPath);
-        console.log(pad + accent('✓') + ' ' + dim(`Workspace synchronized at ${peerRepoPath}`));
-      } catch (e) {
-        peerRepoPath = process.cwd();
       }
+
+      if (!syncSuccess) {
+        continue;
+      }
+
       cleanupStdinForBlessed();
       try {
         launchTUI({ hostName: userName, roomCode: detectedRoomCode, repoPath: peerRepoPath, port: targetPort, hostAddress: hostIp, isPeer: true, detectedAgents: detectInstalledAgents() });

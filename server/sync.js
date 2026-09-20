@@ -153,15 +153,45 @@ export function unpackTarGzToDirectory(tarGzBuffer, targetDir) {
 }
 
 /**
- * Downloads and synchronizes workspace from host daemon
+ * Downloads and synchronizes workspace from host daemon with progress callback and generous timeout for >50MB files
  */
-export async function syncWorkspaceFromHost(hostAddress, port, targetDir) {
+export async function syncWorkspaceFromHost(hostAddress, port, targetDir, onProgress = null) {
   const url = `http://${hostAddress}:${port}/api/room/sync`;
-  const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+  // Generous 120-second timeout to handle large workspaces (>50MB) over Wi-Fi
+  const res = await fetch(url, { signal: AbortSignal.timeout(120000) });
   if (!res.ok) {
     throw new Error(`Failed to sync workspace from host: HTTP ${res.status}`);
   }
-  const arrayBuf = await res.arrayBuffer();
-  const buffer = Buffer.from(arrayBuf);
-  return unpackTarGzToDirectory(buffer, targetDir);
+
+  const contentLengthHeader = res.headers.get('content-length');
+  const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 0;
+
+  if (res.body && typeof res.body.getReader === 'function') {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let receivedBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        receivedBytes += value.length;
+        if (typeof onProgress === 'function') {
+          onProgress(receivedBytes, totalBytes);
+        }
+      }
+    }
+
+    const buffer = Buffer.concat(chunks);
+    return unpackTarGzToDirectory(buffer, targetDir);
+  } else {
+    // Fallback for environments without getReader
+    const arrayBuf = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    if (typeof onProgress === 'function') {
+      onProgress(buffer.length, buffer.length);
+    }
+    return unpackTarGzToDirectory(buffer, targetDir);
+  }
 }
