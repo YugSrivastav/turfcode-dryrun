@@ -8,7 +8,7 @@ import { buildFileTree, flattenFileTree, formatTreeNode, autoExpandParents, getP
 import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
 import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, extractFileCandidates } from '../server/pty_manager.js';
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
-import { getGroqApiKeys, getNextGroqApiKey } from '../server/model_discovery.js';
+import { getGroqApiKeys, getNextGroqApiKey, fetchLiveGeminiModels, invalidateModelCache } from '../server/model_discovery.js';
 import { verifyCode, extractAstSymbols } from '../server/verify.js';
 import { gitMerge3Way, astSemanticMerge, peacemakerMergeSync } from '../server/peacemaker.js';
 import WebSocket from 'ws';
@@ -704,8 +704,13 @@ async function runTests() {
   const origGemini = process.env.GEMINI_API_KEY;
   process.env.GEMINI_API_KEY = 'test-gemini-key';
   const turfModelsWithGemini = await getTurfModels(process.cwd());
+  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-flash'), 'getTurfModels includes latest gemini-2.5-flash when GEMINI_API_KEY exists');
+  assert(turfModelsWithGemini[0].id === 'gemini-2.5-flash', 'getTurfModels prioritizes gemini-2.5-flash as the top recommended model');
   assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.0-flash'), 'getTurfModels includes gemini-2.0-flash when GEMINI_API_KEY exists');
   assert(turfModelsWithGemini.some(m => m.id === 'gemini-1.5-pro'), 'getTurfModels includes gemini-1.5-pro when GEMINI_API_KEY exists');
+  assert(typeof fetchLiveGeminiModels === 'function', 'fetchLiveGeminiModels is exported and callable');
+  assert(typeof invalidateModelCache === 'function', 'invalidateModelCache is exported and callable');
+  invalidateModelCache();
   if (origGemini) process.env.GEMINI_API_KEY = origGemini; else delete process.env.GEMINI_API_KEY;
 
   // 6. Blessed textbox prototype listener crash guard

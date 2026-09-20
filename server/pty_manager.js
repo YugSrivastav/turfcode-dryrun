@@ -11,7 +11,7 @@ import pkgHeadless from '@xterm/headless';
 const { Terminal } = pkgHeadless;
 import pkgSerialize from '@xterm/addon-serialize';
 const { SerializeAddon } = pkgSerialize;
-import { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab } from './model_discovery.js';
+import { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, invalidateModelCache } from './model_discovery.js';
 import { lockRegistry } from './locks.js';
 
 const require = createRequire(import.meta.url);
@@ -104,7 +104,7 @@ export function findBinary(name) {
   return null;
 }
 
-export { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab };
+export { getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, invalidateModelCache };
 
 export function safeEscape(str) {
   if (!str) return '';
@@ -667,11 +667,6 @@ export class PtyManager extends EventEmitter {
 
       if (config.model && config.model !== 'default') {
         let m = config.model;
-        if (m === 'gemini-2.5-flash' || m === 'gemini-2.5-flash-lite') {
-          m = 'gemini-2.0-flash';
-        } else if (m === 'gemini-2.5-pro') {
-          m = 'gemini-1.5-pro';
-        }
         if ((m.startsWith('llama') || m.includes('qwen') || m.includes('gpt-oss') || m.includes('compound')) && !m.includes('/')) {
           args.push('--provider', 'groq', '--model', m);
         } else if ((m.startsWith('gemini') || m.startsWith('gemma')) && !m.includes('/')) {
@@ -680,13 +675,13 @@ export class PtyManager extends EventEmitter {
           args.push('--model', m);
         }
       } else if (env.GEMINI_API_KEY && (!env.GROQ_API_KEY || config.lastTurnFailed)) {
-        args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
+        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
       } else if (!env.ANTHROPIC_API_KEY && env.GROQ_API_KEY) {
         args.push('--provider', 'groq', '--model', 'openai/gpt-oss-120b');
       } else if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
         args.push('--provider', 'openai', '--model', 'gpt-4o');
       } else if (!env.ANTHROPIC_API_KEY && env.GEMINI_API_KEY) {
-        args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
+        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
       }
       if (config.effort && config.effort !== 'medium') {
         args.push('--thinking', config.effort);

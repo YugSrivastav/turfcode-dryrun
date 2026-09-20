@@ -415,12 +415,12 @@ ${agentBChange}
 
 MERGED OUTPUT:`;
 
-  // Gemini 2.0 Flash (Fastest, 1M TPM free tier)
+  // Gemini 2.5 Flash (Fastest, 1M TPM free tier)
   if (geminiKey) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

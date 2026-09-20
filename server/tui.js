@@ -4,7 +4,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import fs from 'fs';
-import { ptyManager, safeEscape, getPaletteModelsForTab, getCmdcModels } from './pty_manager.js';
+import os from 'os';
+import { ptyManager, safeEscape, getPaletteModelsForTab, getCmdcModels, invalidateModelCache } from './pty_manager.js';
 import { lockRegistry } from './locks.js';
 
 
@@ -1175,6 +1176,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     { cmd: '/files', desc: 'Focus workspace file explorer [F3]' },
     { cmd: '/refresh', desc: 'Rescan and refresh workspace file tree' },
     { cmd: '/pwd', desc: 'Display active workspace root directory path' },
+    { cmd: '/key', desc: 'View, add or change AI provider API keys (/key <provider> <key>)' },
     { cmd: '/sidebar', desc: 'Toggle left or right sidebar (/sidebar left | right)' },
     { cmd: '/web', desc: 'Open collaborative web preview browser [Ctrl+O]' },
     { cmd: '/help', desc: 'Show full command documentation and shortcuts' }
@@ -1216,14 +1218,16 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         { cmd: '/model Qwen/Qwen3.8-27B', desc: 'Qwen 3.8 27B (Open-weight coder)' }
       ];
       const fallbackTurf = [
+        { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
+        { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
         { cmd: '/model gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
-        { cmd: '/model gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Deep reasoning)' },
-        { cmd: '/model gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast)' },
+        { cmd: '/model gemini-2.0-flash-lite', desc: 'Google Gemini 2.0 Flash Lite (Ultra-fast)' },
         { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
         { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
         { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
         { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
         { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
+        { cmd: '/model claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet (Hybrid reasoning)' },
         { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
         { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o' }
       ];
@@ -2477,14 +2481,20 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         } else if (activeCenterTab === 'turf') {
           currentLog.log(`{green-fg}Available Turf models (real-time):{/green-fg}`);
           const displayModels = cachedPaletteModels.length > 0 ? cachedPaletteModels : [
+            { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
+            { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
+            { cmd: '/model gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
             { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
             { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
+            { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
             { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
             { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
-            { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' }
+            { cmd: '/model claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet' },
+            { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
+            { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o' }
           ];
           displayModels.forEach(m => currentLog.log(`  • {yellow-fg}${m.cmd.replace('/model ', '')}{/yellow-fg} {white-fg}(${m.desc}){/white-fg}`));
-          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model openai/gpt-oss-120b){/white-fg}`);
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model gemini-2.5-flash){/white-fg}`);
         } else if (activeCenterTab === 'codex') {
           currentLog.log(`{cyan-fg}Common Codex models:{/cyan-fg} o3-mini, gpt-4o, o1`);
           currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model o3-mini){/white-fg}`);
@@ -2585,6 +2595,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/chat <msg>{/bold}          Send team chat message or focus chat`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/refresh, /reload{/bold}   Rescan & refresh workspace file tree`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/pwd, /where{/bold}         Show active workspace root directory path`);
+      currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/key <prov> <key>{/bold}    View or update API keys (gemini, groq, openai, anthropic)`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}/sidebar <left|right>{/bold} Toggle left or right sidebar (or Ctrl+B / Ctrl+E)`);
       currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {bold}Shortcuts:{/bold} [Tab] Focus │ [Ctrl+T] Tab │ [F3] Files │ [Ctrl+O] Web`);
       currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
@@ -2601,6 +2612,101 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       } else {
         toggleLeftSidebar();
         currentLog.log(`{green-fg}✔ Toggled left sidebar (${isLeftSidebarCollapsed ? 'hidden' : 'visible'}){/green-fg}`);
+      }
+      terminalInput.clearValue();
+      focusTerminal();
+      return;
+    }
+
+    if (inputStr === '/key' || inputStr.startsWith('/key ') || inputStr === '/apikey' || inputStr.startsWith('/apikey ')) {
+      const rawArg = inputStr.replace(/^(\/key|\/apikey)\s*/, '').trim();
+      const envFile = path.join(currentDir, '.env');
+      const globalEnv = path.join(os.homedir(), '.turf', '.env');
+
+      if (!rawArg || rawArg === 'list' || rawArg === 'status') {
+        currentLog.log(`{bold}{149-fg}┌─ AI PROVIDER API KEYS (BYOK) ────────────────────────────┐{/149-fg}{/bold}`);
+        const providers = [
+          { name: 'Gemini', env: 'GEMINI_API_KEY', tip: 'Latest Gemini 2.5 Flash / Pro (1M TPM Free)' },
+          { name: 'Groq', env: 'GROQ_API_KEY', tip: 'Llama 3.1 8B, GPT-OSS (20k TPM Free)' },
+          { name: 'Anthropic', env: 'ANTHROPIC_API_KEY', tip: 'Claude 3.7 / 3.5 Sonnet' },
+          { name: 'OpenAI', env: 'OPENAI_API_KEY', tip: 'GPT-4o, o3-mini' },
+          { name: 'DeepSeek', env: 'DEEPSEEK_API_KEY', tip: 'DeepSeek V3 / R1' },
+          { name: 'OpenRouter', env: 'OPENROUTER_API_KEY', tip: 'Multi-provider routing' }
+        ];
+        providers.forEach(p => {
+          const val = process.env[p.env];
+          if (val && val.trim()) {
+            const masked = val.length > 8 ? `${val.slice(0, 4)}...${val.slice(-4)}` : '****';
+            currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} • {bold}${p.name.padEnd(11)}{/bold} {green-fg}[Configured: ${masked}]{/green-fg}`);
+            currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {grey-fg}↳ ${p.tip}{/grey-fg}`);
+          } else {
+            currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} • {bold}${p.name.padEnd(11)}{/bold} {grey-fg}[Not Configured]{/grey-fg} {dim}(${p.tip}){/dim}`);
+          }
+        });
+        currentLog.log(`{bold}{149-fg}├──────────────────────────────────────────────────────────┤{/149-fg}{/bold}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold} {cyan-fg}To set or update a key:{/cyan-fg}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {yellow-fg}/key gemini <your-api-key>{/yellow-fg}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {yellow-fg}/key groq <your-api-key>{/yellow-fg}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {yellow-fg}/key openai <your-api-key>{/yellow-fg}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {yellow-fg}/key anthropic <your-api-key>{/yellow-fg}`);
+        currentLog.log(`{bold}{149-fg}│{/149-fg}{/bold}   {yellow-fg}/key deepseek <your-api-key>{/yellow-fg}`);
+        currentLog.log(`{bold}{149-fg}└──────────────────────────────────────────────────────────┘{/149-fg}{/bold}`);
+      } else {
+        let providerName = '';
+        let keyValue = '';
+        if (rawArg.includes('=')) {
+          const eqIdx = rawArg.indexOf('=');
+          providerName = rawArg.substring(0, eqIdx).trim();
+          keyValue = rawArg.substring(eqIdx + 1).trim();
+        } else {
+          const spaceIdx = rawArg.indexOf(' ');
+          if (spaceIdx !== -1) {
+            providerName = rawArg.substring(0, spaceIdx).trim();
+            keyValue = rawArg.substring(spaceIdx + 1).trim();
+          }
+        }
+
+        const norm = providerName.toUpperCase().replace(/_API_KEY$/, '');
+        let targetEnv = '';
+        if (norm === 'GEMINI' || norm === 'GOOGLE') targetEnv = 'GEMINI_API_KEY';
+        else if (norm === 'GROQ') targetEnv = 'GROQ_API_KEY';
+        else if (norm === 'ANTHROPIC' || norm === 'CLAUDE') targetEnv = 'ANTHROPIC_API_KEY';
+        else if (norm === 'OPENAI' || norm === 'GPT') targetEnv = 'OPENAI_API_KEY';
+        else if (norm === 'DEEPSEEK') targetEnv = 'DEEPSEEK_API_KEY';
+        else if (norm === 'OPENROUTER') targetEnv = 'OPENROUTER_API_KEY';
+        else if (norm === 'CEREBRAS') targetEnv = 'CEREBRAS_API_KEY';
+        else if (providerName.includes('_KEY')) targetEnv = providerName;
+
+        if (!targetEnv || !keyValue) {
+          currentLog.log(`{red-fg}❌ Invalid format. Usage: /key <gemini|groq|openai|anthropic|deepseek> <api-key>{/red-fg}`);
+          currentLog.log(`{grey-fg}Example: /key gemini AIzaSyYourKeyHere{/grey-fg}`);
+        } else {
+          process.env[targetEnv] = keyValue;
+
+          const updateEnvFile = (filePath) => {
+            try {
+              fs.mkdirSync(path.dirname(filePath), { recursive: true });
+              let content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '';
+              if (!content.endsWith('\n') && content.length > 0) content += '\n';
+              const lineRe = new RegExp(`^${targetEnv}=.*$`, 'm');
+              content = lineRe.test(content)
+                ? content.replace(lineRe, `${targetEnv}=${keyValue}`)
+                : content + `${targetEnv}=${keyValue}\n`;
+              fs.writeFileSync(filePath, content, 'utf8');
+            } catch (e) {}
+          };
+
+          updateEnvFile(envFile);
+          updateEnvFile(globalEnv);
+
+          invalidateModelCache();
+          refreshPaletteModels();
+
+          const masked = keyValue.length > 8 ? `${keyValue.slice(0, 4)}...${keyValue.slice(-4)}` : '****';
+          currentLog.log(`{green-fg}✔ Successfully updated ${targetEnv} (${masked})!{/green-fg}`);
+          currentLog.log(`{grey-fg}Saved to ${envFile} and global ~/.turf/.env{/grey-fg}`);
+          currentLog.log(`{cyan-fg}Live model list refreshed with new key. Use /model to view or select.{/cyan-fg}`);
+        }
       }
       terminalInput.clearValue();
       focusTerminal();

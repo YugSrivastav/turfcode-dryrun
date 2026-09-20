@@ -5,10 +5,18 @@ import dotenv from 'dotenv';
 // Cache for live models with TTL (5 minutes)
 const modelCache = {
   groq: { timestamp: 0, models: [] },
+  gemini: { timestamp: 0, models: [] },
   openai: { timestamp: 0, models: [] },
   cmdc: { timestamp: 0, models: [] }
 };
 const CACHE_TTL_MS = 5 * 60 * 1000;
+
+export function invalidateModelCache() {
+  modelCache.groq = { timestamp: 0, models: [] };
+  modelCache.gemini = { timestamp: 0, models: [] };
+  modelCache.openai = { timestamp: 0, models: [] };
+  modelCache.cmdc = { timestamp: 0, models: [] };
+}
 
 function ensureEnv(cwd) {
   if (cwd && fs.existsSync(path.join(cwd, '.env'))) {
@@ -78,6 +86,126 @@ export async function fetchLiveGroqModels(apiKey) {
   }
 }
 
+/**
+ * Fetch live available models from Google Gemini API in real time using GEMINI_API_KEY
+ */
+export async function fetchLiveGeminiModels(apiKey) {
+  if (!apiKey) return [];
+  const now = Date.now();
+  if (modelCache.gemini && modelCache.gemini.models.length > 0 && (now - modelCache.gemini.timestamp) < CACHE_TTL_MS) {
+    return modelCache.gemini.models;
+  }
+
+  try {
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey.trim()}`, {
+      signal: AbortSignal.timeout(3500)
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data || !Array.isArray(data.models)) return [];
+
+    const contentModels = data.models
+      .filter(m => {
+        const methods = m.supportedGenerationMethods || [];
+        return methods.includes('generateContent');
+      })
+      .map(m => {
+        const id = m.name.replace(/^models\//, '');
+        const displayName = m.displayName || id;
+        let desc = m.description || 'Google Gemini Model';
+        if (id.includes('2.5-flash')) desc = `${displayName} (Latest flagship - 1M TPM Free - Recommended)`;
+        else if (id.includes('2.5-pro')) desc = `${displayName} (Advanced reasoning & coding)`;
+        else if (id.includes('2.0-flash-lite')) desc = `${displayName} (High speed, cost efficient)`;
+        else if (id.includes('2.0-flash')) desc = `${displayName} (High speed multimodal)`;
+        else if (id.includes('1.5-pro')) desc = `${displayName} (Deep context)`;
+        else if (id.includes('1.5-flash')) desc = `${displayName} (Fast inference)`;
+        return { id, label: id, desc };
+      })
+      .filter(m => {
+        const lower = m.id.toLowerCase();
+        return (lower.includes('gemini') || lower.includes('gemma')) &&
+          !lower.includes('embedding') &&
+          !lower.includes('aqa') &&
+          !lower.includes('imagen');
+      });
+
+    contentModels.sort((a, b) => {
+      const rank = (id) => {
+        if (id === 'gemini-2.5-flash') return 1;
+        if (id === 'gemini-2.5-pro') return 2;
+        if (id === 'gemini-2.0-flash') return 3;
+        if (id === 'gemini-2.0-flash-lite') return 4;
+        if (id.includes('2.5')) return 5;
+        if (id.includes('2.0')) return 6;
+        if (id.includes('1.5-pro')) return 7;
+        if (id.includes('1.5-flash')) return 8;
+        return 9;
+      };
+      return rank(a.id) - rank(b.id);
+    });
+
+    if (contentModels.length > 0) {
+      modelCache.gemini = { timestamp: now, models: contentModels };
+      return contentModels;
+    }
+    return [];
+  } catch (err) {
+    return [];
+  }
+}
+
+/**
+ * Fetch live available models from OpenAI API in real time using OPENAI_API_KEY
+ */
+export async function fetchLiveOpenAIModels(apiKey) {
+  if (!apiKey) return [];
+  const now = Date.now();
+  if (modelCache.openai && modelCache.openai.models.length > 0 && (now - modelCache.openai.timestamp) < CACHE_TTL_MS) {
+    return modelCache.openai.models;
+  }
+
+  try {
+    const res = await fetch('https://api.openai.com/v1/models', {
+      headers: { 'Authorization': `Bearer ${apiKey.trim()}` },
+      signal: AbortSignal.timeout(3000)
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data || !Array.isArray(data.data)) return [];
+
+    const allowed = ['o3-mini', 'o1', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-4.5-preview'];
+    const filtered = data.data
+      .map(m => m.id)
+      .filter(id => allowed.includes(id) || id.startsWith('gpt-4') || id.startsWith('o1') || id.startsWith('o3'))
+      .map(id => {
+        let desc = 'OpenAI model';
+        if (id === 'o3-mini') desc = 'OpenAI o3-mini (High reasoning, fast)';
+        else if (id === 'gpt-4o') desc = 'OpenAI GPT-4o (Multimodal intelligence)';
+        else if (id === 'gpt-4o-mini') desc = 'OpenAI GPT-4o Mini (Fast & affordable)';
+        else if (id === 'o1') desc = 'OpenAI o1 (Full reasoning depth)';
+        return { id, label: id, desc };
+      });
+
+    filtered.sort((a, b) => {
+      const order = ['o3-mini', 'gpt-4o', 'gpt-4o-mini', 'o1'];
+      const aIdx = order.indexOf(a.id);
+      const bIdx = order.indexOf(b.id);
+      if (aIdx !== -1 && bIdx !== -1) return aIdx - bIdx;
+      if (aIdx !== -1) return -1;
+      if (bIdx !== -1) return 1;
+      return a.id.localeCompare(b.id);
+    });
+
+    if (filtered.length > 0) {
+      modelCache.openai = { timestamp: now, models: filtered };
+      return filtered;
+    }
+    return [];
+  } catch (err) {
+    return [];
+  }
+}
+
 let currentKeyIndex = 0;
 
 /**
@@ -117,14 +245,25 @@ export async function getTurfModels(cwd) {
   ensureEnv(cwd);
 
   const models = [];
+  const geminiKey = process.env.GEMINI_API_KEY;
   const groqKey = getNextGroqApiKey(cwd) || process.env.GROQ_API_KEY;
+  const anthropicKey = process.env.ANTHROPIC_API_KEY;
+  const openaiKey = process.env.OPENAI_API_KEY;
 
-  if (process.env.GEMINI_API_KEY) {
-    models.push(
-      { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier - Recommended)' },
-      { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast Free Tier)' },
-      { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Deep reasoning)' }
-    );
+  if (geminiKey) {
+    const liveGemini = await fetchLiveGeminiModels(geminiKey);
+    if (liveGemini.length > 0) {
+      models.push(...liveGemini);
+    } else {
+      models.push(
+        { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
+        { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
+        { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
+        { id: 'gemini-2.0-flash-lite', label: 'gemini-2.0-flash-lite', desc: 'Google Gemini 2.0 Flash Lite (Ultra-fast)' },
+        { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Long context)' },
+        { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast Free Tier)' }
+      );
+    }
   }
 
   if (groqKey) {
@@ -145,18 +284,24 @@ export async function getTurfModels(cwd) {
     }
   }
 
-  if (process.env.ANTHROPIC_API_KEY) {
+  if (anthropicKey) {
     models.push(
+      { id: 'claude-3-7-sonnet', label: 'claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet (Hybrid reasoning & coding)' },
       { id: 'claude-3-5-sonnet', label: 'claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet (Default coding)' },
       { id: 'claude-3-5-haiku', label: 'claude-3-5-haiku', desc: 'Anthropic Claude 3.5 Haiku (Fast & light)' }
     );
   }
 
-  if (process.env.OPENAI_API_KEY) {
-    models.push(
-      { id: 'gpt-4o', label: 'gpt-4o', desc: 'OpenAI GPT-4o (Multimodal intelligence)' },
-      { id: 'o3-mini', label: 'o3-mini', desc: 'OpenAI o3-mini (High reasoning speed)' }
-    );
+  if (openaiKey) {
+    const liveOpenAI = await fetchLiveOpenAIModels(openaiKey);
+    if (liveOpenAI.length > 0) {
+      models.push(...liveOpenAI);
+    } else {
+      models.push(
+        { id: 'gpt-4o', label: 'gpt-4o', desc: 'OpenAI GPT-4o (Multimodal intelligence)' },
+        { id: 'o3-mini', label: 'o3-mini', desc: 'OpenAI o3-mini (High reasoning speed)' }
+      );
+    }
   }
 
   if (models.length > 0) {
@@ -169,9 +314,13 @@ export async function getTurfModels(cwd) {
   }
 
   return [
+    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free Tier - Recommended)' },
+    { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
     { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
+    { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro' },
     { id: 'llama-3.1-8b-instant', label: 'llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
     { id: 'openai/gpt-oss-120b', label: 'openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Recommended)' },
+    { id: 'claude-3-7-sonnet', label: 'claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet' },
     { id: 'claude-3-5-sonnet', label: 'claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
     { id: 'gpt-4o', label: 'gpt-4o', desc: 'OpenAI GPT-4o' },
     { id: 'o3-mini', label: 'o3-mini', desc: 'OpenAI o3-mini' }
@@ -201,6 +350,11 @@ export function getCmdcModels() {
  */
 export async function getCodexModels(cwd) {
   ensureEnv(cwd);
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (openaiKey) {
+    const live = await fetchLiveOpenAIModels(openaiKey);
+    if (live.length > 0) return live;
+  }
   return [
     { id: 'o3-mini', label: 'o3-mini', desc: 'OpenAI o3-mini (High reasoning, fast)' },
     { id: 'gpt-4o', label: 'gpt-4o', desc: 'OpenAI GPT-4o (Fast multimodal intelligence)' },

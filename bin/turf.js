@@ -152,6 +152,7 @@ function printBanner() {
   console.log('');
   console.log(pad + brandTurf('[1]') + ' ' + bright('Create Turf') + '  ' + dim('— Host a new collaborative session'));
   console.log(pad + brandTurf('[2]') + ' ' + bright('Join Turf  ') + '  ' + dim('— Connect to an existing team room'));
+  console.log(pad + brandTurf('[3]') + ' ' + bright('API Keys   ') + '  ' + dim('— Configure or update AI provider keys (BYOK)'));
   console.log('');
 }
 
@@ -294,10 +295,10 @@ async function normalizeAndValidatePath(input, promptFn, pad = '') {
 
 // LLM providers the Turf agent can call (env names per Pi provider docs).
 const TURF_PROVIDERS = [
-  { label: 'Google Gemini Studio (FREE tier - 1,000,000 TPM - Recommended)', env: 'GEMINI_API_KEY' },
+  { label: 'Google Gemini Studio (FREE tier - 1,000,000 TPM - Recommended: Gemini 2.5 Flash)', env: 'GEMINI_API_KEY' },
   { label: 'Groq (FREE tier - 20,000 TPM)', env: 'GROQ_API_KEY' },
-  { label: 'Anthropic', env: 'ANTHROPIC_API_KEY' },
-  { label: 'OpenAI', env: 'OPENAI_API_KEY' },
+  { label: 'Anthropic (Claude 3.7 / 3.5)', env: 'ANTHROPIC_API_KEY' },
+  { label: 'OpenAI (GPT-4o, o3-mini)', env: 'OPENAI_API_KEY' },
   { label: 'DeepSeek', env: 'DEEPSEEK_API_KEY' },
   { label: 'OpenRouter', env: 'OPENROUTER_API_KEY' },
   { label: 'Cerebras (free tier)', env: 'CEREBRAS_API_KEY' }
@@ -511,16 +512,22 @@ async function main() {
 
   while (true) {
     let option = '';
-    while (option !== '1' && option !== '2') {
+    while (option !== '1' && option !== '2' && option !== '3') {
       printBanner();
       const pad = getBlockPad(58);
-      option = await prompt(pad + accent('›') + ' ' + bright('Select an option') + ' ' + dim('[1/2]: '));
+      option = await prompt(pad + accent('›') + ' ' + bright('Select an option') + ' ' + dim('[1/2/3]: '));
       if (option === '__BACK__') {
         continue;
       }
     }
 
     const pad = getBlockPad(58);
+
+    if (option === '3') {
+      printSetupHeader('API Key Configuration', '— Manage AI provider keys');
+      await setupTurfApiKey((q) => prompt(q), pad, process.cwd(), true);
+      continue;
+    }
 
     if (option === '1') {
       printSetupHeader('Host Collaborative Session', '— Create a team room');
