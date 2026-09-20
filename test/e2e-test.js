@@ -8,7 +8,7 @@ import { buildFileTree, flattenFileTree, formatTreeNode, autoExpandParents, getP
 import { normalizeAndValidatePath, setupTurfApiKey, hasAnyConfiguredKey, TURF_PROVIDERS } from '../bin/turf.js';
 import { ptyManager, isAgentAvailable, safeEscape, parseCodexJsonLine, parseCmdcJsonLine, parseAgyJsonLine, parseTurfJsonLine, getTurfModels, getCmdcModels, getCodexModels, getPaletteModelsForTab, extractFileCandidates } from '../server/pty_manager.js';
 import { packDirectoryToTarGz, unpackTarGzToDirectory, syncWorkspaceFromHost } from '../server/sync.js';
-import { getGroqApiKeys, getNextGroqApiKey, fetchLiveGeminiModels, invalidateModelCache } from '../server/model_discovery.js';
+import { getGroqApiKeys, getNextGroqApiKey, fetchLiveGeminiModels, fetchLiveDeepSeekModels, invalidateModelCache } from '../server/model_discovery.js';
 import { verifyCode, extractAstSymbols } from '../server/verify.js';
 import { gitMerge3Way, astSemanticMerge, peacemakerMergeSync, peacemakerMerge } from '../server/peacemaker.js';
 import WebSocket from 'ws';
@@ -617,13 +617,13 @@ async function runTests() {
 
   const turfModels = await getTurfModels();
   assert(Array.isArray(turfModels) && turfModels.length > 0, 'getTurfModels returns models list');
-  assert(turfModels.some(m => m.id === 'openai/gpt-oss-120b'), 'turf models includes openai/gpt-oss-120b');
+  assert(turfModels.some(m => m.id.includes('deepseek') || m.id === 'openai/gpt-oss-120b'), 'turf models includes deepseek or openai/gpt-oss-120b');
 
   const codexModels = await getCodexModels();
   assert(Array.isArray(codexModels) && codexModels.some(m => m.id === 'o3-mini'), 'codex models includes o3-mini');
 
   const paletteTurf = await getPaletteModelsForTab('turf');
-  assert(paletteTurf.some(m => m.cmd.includes('openai/gpt-oss-120b')), 'getPaletteModelsForTab(turf) contains gpt-oss-120b');
+  assert(paletteTurf.some(m => m.cmd.includes('deepseek') || m.cmd.includes('openai/gpt-oss-120b')), 'getPaletteModelsForTab(turf) contains deepseek or gpt-oss-120b');
   const paletteCmdc = await getPaletteModelsForTab('cmdc');
   assert(paletteCmdc.some(m => m.cmd.includes('/model')), 'getPaletteModelsForTab(cmdc) returns /model commands');
 
@@ -689,29 +689,28 @@ async function runTests() {
   assert(askedQuestions.some(q => q.includes('Do you want to add more keys')), 'setupTurfApiKey asks user if they want to add more keys');
 
   // 4. setupTurfApiKey saves new key when user responds 'y'
-  const promptResponses = ['y', '1', 'gemini-new-studio-key', 'n'];
+  const deepseekOptionNum = String(TURF_PROVIDERS.findIndex(p => p.env === 'DEEPSEEK_API_KEY') + 1);
+  const promptResponses = ['y', deepseekOptionNum, 'sk-test-deepseek-key-123', 'n'];
   let rIdx = 0;
   const mockPromptYes = async (q) => {
     return promptResponses[rIdx++] || 'n';
   };
   const addResult = await setupTurfApiKey(mockPromptYes, '', testTmpDir);
-  assert(addResult === 'GEMINI_API_KEY', 'setupTurfApiKey successfully saved GEMINI_API_KEY');
+  assert(addResult === 'DEEPSEEK_API_KEY', 'setupTurfApiKey successfully saved DEEPSEEK_API_KEY');
   const savedEnv = fs.readFileSync(path.join(testTmpDir, '.env'), 'utf8');
-  assert(savedEnv.includes('gemini-new-studio-key'), '.env contains the newly added Gemini key');
+  assert(savedEnv.includes('sk-test-deepseek-key-123'), '.env contains the newly added DeepSeek key');
   try { fs.rmSync(testTmpDir, { recursive: true, force: true }); } catch (e) {}
 
-  // 5. getTurfModels with GEMINI_API_KEY
-  const origGemini = process.env.GEMINI_API_KEY;
-  process.env.GEMINI_API_KEY = 'test-gemini-key';
-  const turfModelsWithGemini = await getTurfModels(process.cwd());
-  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.5-flash'), 'getTurfModels includes latest gemini-2.5-flash when GEMINI_API_KEY exists');
-  assert(turfModelsWithGemini[0].id === 'gemini-2.5-flash', 'getTurfModels prioritizes gemini-2.5-flash as the top recommended model');
-  assert(turfModelsWithGemini.some(m => m.id === 'gemini-2.0-flash'), 'getTurfModels includes gemini-2.0-flash when GEMINI_API_KEY exists');
-  assert(turfModelsWithGemini.some(m => m.id === 'gemini-1.5-pro'), 'getTurfModels includes gemini-1.5-pro when GEMINI_API_KEY exists');
-  assert(typeof fetchLiveGeminiModels === 'function', 'fetchLiveGeminiModels is exported and callable');
+  // 5. getTurfModels with DEEPSEEK_API_KEY
+  const origDeepSeek = process.env.DEEPSEEK_API_KEY;
+  process.env.DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY || 'sk-test-deepseek-key-mock';
+  const turfModelsWithDeepSeek = await getTurfModels(process.cwd());
+  assert(turfModelsWithDeepSeek.some(m => m.id === 'deepseek-v4-flash'), 'getTurfModels includes deepseek-v4-flash when DEEPSEEK_API_KEY exists');
+  assert(turfModelsWithDeepSeek[0].id === 'deepseek-v4-flash', 'getTurfModels prioritizes deepseek-v4-flash as the top recommended model');
+  assert(typeof fetchLiveDeepSeekModels === 'function', 'fetchLiveDeepSeekModels is exported and callable');
   assert(typeof invalidateModelCache === 'function', 'invalidateModelCache is exported and callable');
   invalidateModelCache();
-  if (origGemini) process.env.GEMINI_API_KEY = origGemini; else delete process.env.GEMINI_API_KEY;
+  if (origDeepSeek) process.env.DEEPSEEK_API_KEY = origDeepSeek;
 
   // 6. Blessed textbox prototype listener crash guard
   let listenerEmittedSubmit = false;

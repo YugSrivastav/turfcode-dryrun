@@ -675,21 +675,24 @@ export class PtyManager extends EventEmitter {
 
       if (config.model && config.model !== 'default') {
         let m = config.model;
-        if ((m.startsWith('llama') || m.includes('qwen') || m.includes('gpt-oss') || m.includes('compound')) && !m.includes('/')) {
+        if (m.startsWith('deepseek') && !m.includes('/')) {
+          const modelId = (m === 'deepseek-chat' || m === 'deepseek-flash') ? 'deepseek-v4-flash' : (m === 'deepseek-reasoner' ? 'deepseek-v4-pro' : m);
+          args.push('--provider', 'deepseek', '--model', modelId);
+        } else if ((m.startsWith('llama') || m.includes('qwen') || m.includes('gpt-oss') || m.includes('compound')) && !m.includes('/')) {
           args.push('--provider', 'groq', '--model', m);
         } else if ((m.startsWith('gemini') || m.startsWith('gemma')) && !m.includes('/')) {
           args.push('--provider', 'google', '--model', m);
         } else {
           args.push('--model', m);
         }
-      } else if (env.GEMINI_API_KEY && (!env.GROQ_API_KEY || config.lastTurnFailed)) {
-        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+      } else if (env.DEEPSEEK_API_KEY) {
+        args.push('--provider', 'deepseek', '--model', 'deepseek-v4-flash');
       } else if (!env.ANTHROPIC_API_KEY && env.GROQ_API_KEY) {
         args.push('--provider', 'groq', '--model', 'openai/gpt-oss-120b');
       } else if (!env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY) {
         args.push('--provider', 'openai', '--model', 'gpt-4o');
-      } else if (!env.ANTHROPIC_API_KEY && env.GEMINI_API_KEY) {
-        args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+      } else if (env.GEMINI_API_KEY) {
+        args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
       }
       if (config.effort && config.effort !== 'medium') {
         args.push('--thinking', config.effort);

@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 
 // Cache for live models with TTL (5 minutes)
 const modelCache = {
+  deepseek: { timestamp: 0, models: [] },
   groq: { timestamp: 0, models: [] },
   gemini: { timestamp: 0, models: [] },
   openai: { timestamp: 0, models: [] },
@@ -12,6 +13,7 @@ const modelCache = {
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 export function invalidateModelCache() {
+  modelCache.deepseek = { timestamp: 0, models: [] };
   modelCache.groq = { timestamp: 0, models: [] };
   modelCache.gemini = { timestamp: 0, models: [] };
   modelCache.openai = { timestamp: 0, models: [] };
@@ -26,6 +28,37 @@ function ensureEnv(cwd) {
         if (!process.env[k]) process.env[k] = v;
       }
     } catch (e) {}
+  }
+}
+
+/**
+ * Fetch live available models from DeepSeek API in real time using DEEPSEEK_API_KEY
+ */
+export async function fetchLiveDeepSeekModels(apiKey) {
+  if (!apiKey) return [];
+  const now = Date.now();
+  if (modelCache.deepseek && modelCache.deepseek.models.length > 0 && (now - modelCache.deepseek.timestamp) < CACHE_TTL_MS) {
+    return modelCache.deepseek.models;
+  }
+
+  try {
+    const res = await fetch('https://api.deepseek.com/models', {
+      headers: { 'Authorization': `Bearer ${apiKey.trim()}` },
+      signal: AbortSignal.timeout(3500)
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data || !Array.isArray(data.data)) return [];
+
+    const models = [
+      { id: 'deepseek-v4-flash', label: 'deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Flagship coder - Ultra-fast - Recommended)' },
+      { id: 'deepseek-v4-pro', label: 'deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep reasoning, math & architecture)' }
+    ];
+
+    modelCache.deepseek = { timestamp: now, models };
+    return models;
+  } catch (err) {
+    return [];
   }
 }
 
@@ -245,23 +278,20 @@ export async function getTurfModels(cwd) {
   ensureEnv(cwd);
 
   const models = [];
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY;
   const groqKey = getNextGroqApiKey(cwd) || process.env.GROQ_API_KEY;
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
 
-  if (geminiKey) {
-    const liveGemini = await fetchLiveGeminiModels(geminiKey);
-    if (liveGemini.length > 0) {
-      models.push(...liveGemini);
+  if (deepseekKey) {
+    const liveDeepSeek = await fetchLiveDeepSeekModels(deepseekKey);
+    if (liveDeepSeek.length > 0) {
+      models.push(...liveDeepSeek);
     } else {
       models.push(
-        { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
-        { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
-        { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
-        { id: 'gemini-2.0-flash-lite', label: 'gemini-2.0-flash-lite', desc: 'Google Gemini 2.0 Flash Lite (Ultra-fast)' },
-        { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Long context)' },
-        { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast Free Tier)' }
+        { id: 'deepseek-v4-flash', label: 'deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Flagship coder - Ultra-fast - Recommended)' },
+        { id: 'deepseek-v4-pro', label: 'deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep reasoning, math & architecture)' }
       );
     }
   }
@@ -280,6 +310,22 @@ export async function getTurfModels(cwd) {
         { id: 'openai/gpt-oss-20b', label: 'openai/gpt-oss-20b', desc: 'GPT-OSS 20B (High speed, low latency)' },
         { id: 'qwen/qwen3.8-27b', label: 'qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
         { id: 'groq/compound', label: 'groq/compound', desc: 'Groq Compound (Agentic router)' }
+      );
+    }
+  }
+
+  if (geminiKey) {
+    const liveGemini = await fetchLiveGeminiModels(geminiKey);
+    if (liveGemini.length > 0) {
+      models.push(...liveGemini);
+    } else {
+      models.push(
+        { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
+        { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
+        { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
+        { id: 'gemini-2.0-flash-lite', label: 'gemini-2.0-flash-lite', desc: 'Google Gemini 2.0 Flash Lite (Ultra-fast)' },
+        { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro (Long context)' },
+        { id: 'gemini-1.5-flash', label: 'gemini-1.5-flash', desc: 'Google Gemini 1.5 Flash (Ultra-fast Free Tier)' }
       );
     }
   }
@@ -314,12 +360,10 @@ export async function getTurfModels(cwd) {
   }
 
   return [
-    { id: 'gemini-2.5-flash', label: 'gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free Tier - Recommended)' },
-    { id: 'gemini-2.5-pro', label: 'gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
-    { id: 'gemini-2.0-flash', label: 'gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
-    { id: 'gemini-1.5-pro', label: 'gemini-1.5-pro', desc: 'Google Gemini 1.5 Pro' },
-    { id: 'llama-3.1-8b-instant', label: 'llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
-    { id: 'openai/gpt-oss-120b', label: 'openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Recommended)' },
+    { id: 'deepseek-v4-flash', label: 'deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Flagship coder - Ultra-fast - Recommended)' },
+    { id: 'deepseek-v4-pro', label: 'deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep reasoning, math & architecture)' },
+    { id: 'llama-3.1-8b-instant', label: 'llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (20,000 TPM Free Tier)' },
+    { id: 'openai/gpt-oss-120b', label: 'openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
     { id: 'claude-3-7-sonnet', label: 'claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet' },
     { id: 'claude-3-5-sonnet', label: 'claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
     { id: 'gpt-4o', label: 'gpt-4o', desc: 'OpenAI GPT-4o' },

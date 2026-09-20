@@ -397,6 +397,7 @@ export async function peacemakerMerge(filePath, baseCode, agentAChange, agentBCh
   }
 
   // 2. Try LLM Reconciliation if API key exists
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
   const geminiKey = process.env.GEMINI_API_KEY;
   const anthropicKey = process.env.ANTHROPIC_API_KEY;
   const openaiKey = process.env.OPENAI_API_KEY;
@@ -421,12 +422,39 @@ ${agentBChange}
 
 MERGED OUTPUT:`;
 
-  // Gemini 2.5 Flash (Fastest, 1M TPM free tier)
+  // 1. DeepSeek (DeepSeek V3 / Chat)
+  if (deepseekKey) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 6000);
+      const res = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: {
+          'authorization': `Bearer ${deepseekKey.trim()}`,
+          'content-type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.0
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+      if (res.ok) {
+        const data = await res.json();
+        const text = data?.choices?.[0]?.message?.content;
+        if (text) return stripMarkdown(text);
+      }
+    } catch (e) {}
+  }
+
+  // Gemini (Fastest, free tier fallback)
   if (geminiKey) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 6000);
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${geminiKey}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

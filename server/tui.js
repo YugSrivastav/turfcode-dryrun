@@ -1129,7 +1129,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     cmdcLog.log(`{bold}{magenta-fg}COMMAND CODE AGENT{/magenta-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     codexLog.log(`{bold}{cyan-fg}OPENAI CODEX AGENT{/cyan-fg}{/bold} {grey-fg}│ Enter task prompt or /term to return to shell{/grey-fg}`);
     turfLog.log(`{bold}{149-fg}⚡ TURF AGENT 2.5{/149-fg}{/bold} {grey-fg}│ Real-Time Intent Board & Speculative Worktrees Active{/grey-fg}`);
-    turfLog.log(`{grey-fg}Engine: {149-fg}Gemini 2.5 Flash{/149-fg} │ 3-Way AST Peacemaker: {green-fg}ONLINE{/green-fg} │ Press {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} or {bold}{yellow-fg}/demo{/yellow-fg}{/bold} for live rehearsal{/grey-fg}`);
+    turfLog.log(`{grey-fg}Engine: {149-fg}DeepSeek V4 Flash / Pro{/149-fg} │ 3-Way AST Peacemaker: {green-fg}ONLINE{/green-fg} │ Press {bold}{yellow-fg}[F5]{/yellow-fg}{/bold} or {bold}{yellow-fg}/demo{/yellow-fg}{/bold} for live rehearsal{/grey-fg}`);
   }
   printWelcomeBanner();
 
@@ -1220,17 +1220,13 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         { cmd: '/model Qwen/Qwen3.8-27B', desc: 'Qwen 3.8 27B (Open-weight coder)' }
       ];
       const fallbackTurf = [
-        { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
-        { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
-        { cmd: '/model gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
-        { cmd: '/model gemini-2.0-flash-lite', desc: 'Google Gemini 2.0 Flash Lite (Ultra-fast)' },
+        { cmd: '/model deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Flagship coder - Ultra-fast - Recommended)' },
+        { cmd: '/model deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep reasoning, math & architecture)' },
         { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
         { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
         { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
         { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
-        { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
         { cmd: '/model claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet (Hybrid reasoning)' },
-        { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
         { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o' }
       ];
       const fallbackCodex = [
@@ -2485,20 +2481,17 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         } else if (activeCenterTab === 'turf') {
           currentLog.log(`{green-fg}Available Turf models (real-time):{/green-fg}`);
           const displayModels = cachedPaletteModels.length > 0 ? cachedPaletteModels : [
-            { cmd: '/model gemini-2.5-flash', desc: 'Google Gemini 2.5 Flash (Latest 1M TPM Free - Recommended)' },
-            { cmd: '/model gemini-2.5-pro', desc: 'Google Gemini 2.5 Pro (Deep reasoning & coding)' },
-            { cmd: '/model gemini-2.0-flash', desc: 'Google Gemini 2.0 Flash (1,000,000 TPM Free Tier)' },
+            { cmd: '/model deepseek-v4-flash', desc: 'DeepSeek V4 Flash (Flagship coder - Ultra-fast - Recommended)' },
+            { cmd: '/model deepseek-v4-pro', desc: 'DeepSeek V4 Pro (Deep reasoning, math & architecture)' },
             { cmd: '/model openai/gpt-oss-120b', desc: 'Groq GPT-OSS 120B (Deep reasoning, ultra-fast)' },
             { cmd: '/model openai/gpt-oss-20b', desc: 'Groq GPT-OSS 20B (High speed, low latency)' },
             { cmd: '/model llama-3.1-8b-instant', desc: 'Groq Llama 3.1 8B (High TPM Free Tier)' },
             { cmd: '/model qwen/qwen3.8-27b', desc: 'Qwen 3.8 27B (Coding & reasoning)' },
-            { cmd: '/model groq/compound', desc: 'Groq Compound (Agentic router)' },
             { cmd: '/model claude-3-7-sonnet', desc: 'Anthropic Claude 3.7 Sonnet' },
-            { cmd: '/model claude-3-5-sonnet', desc: 'Anthropic Claude 3.5 Sonnet' },
             { cmd: '/model gpt-4o', desc: 'OpenAI GPT-4o' }
           ];
           displayModels.forEach(m => currentLog.log(`  • {yellow-fg}${m.cmd.replace('/model ', '')}{/yellow-fg} {white-fg}(${m.desc}){/white-fg}`));
-          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model gemini-2.5-flash){/white-fg}`);
+          currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model deepseek-v4-flash){/white-fg}`);
         } else if (activeCenterTab === 'codex') {
           currentLog.log(`{cyan-fg}Common Codex models:{/cyan-fg} o3-mini, gpt-4o, o1`);
           currentLog.log(`{white-fg}Usage: /model <model-name> (e.g. /model o3-mini){/white-fg}`);
@@ -2631,11 +2624,11 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
       if (!rawArg || rawArg === 'list' || rawArg === 'status') {
         currentLog.log(`{bold}{149-fg}┌─ AI PROVIDER API KEYS (BYOK) ────────────────────────────┐{/149-fg}{/bold}`);
         const providers = [
-          { name: 'Gemini', env: 'GEMINI_API_KEY', tip: 'Latest Gemini 2.5 Flash / Pro (1M TPM Free)' },
+          { name: 'DeepSeek', env: 'DEEPSEEK_API_KEY', tip: 'DeepSeek V4 Flash / Pro (Recommended Flagship)' },
           { name: 'Groq', env: 'GROQ_API_KEY', tip: 'Llama 3.1 8B, GPT-OSS (20k TPM Free)' },
           { name: 'Anthropic', env: 'ANTHROPIC_API_KEY', tip: 'Claude 3.7 / 3.5 Sonnet' },
           { name: 'OpenAI', env: 'OPENAI_API_KEY', tip: 'GPT-4o, o3-mini' },
-          { name: 'DeepSeek', env: 'DEEPSEEK_API_KEY', tip: 'DeepSeek V3 / R1' },
+          { name: 'Gemini', env: 'GEMINI_API_KEY', tip: 'Gemini Flash' },
           { name: 'OpenRouter', env: 'OPENROUTER_API_KEY', tip: 'Multi-provider routing' }
         ];
         providers.forEach(p => {

@@ -64,10 +64,14 @@ if (!hasPrint && (isModeJson || hasPositionalPrompt)) {
 
 // Auto-configure provider if not explicitly given
 if (!args.includes('--provider') && !args.some(a => a.startsWith('--provider='))) {
-  if (env.GEMINI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
-    args.push('--provider', 'google', '--model', 'gemini-2.5-flash');
+  if (env.DEEPSEEK_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
+    args.push('--provider', 'deepseek', '--model', 'deepseek-v4-flash');
   } else if (env.GROQ_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
     args.push('--provider', 'groq', '--model', 'llama-3.3-70b-versatile');
+  } else if (env.OPENAI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
+    args.push('--provider', 'openai', '--model', 'gpt-4o');
+  } else if (env.GEMINI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
+    args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
   }
 }
 

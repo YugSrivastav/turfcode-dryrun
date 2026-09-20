@@ -295,11 +295,11 @@ async function normalizeAndValidatePath(input, promptFn, pad = '') {
 
 // LLM providers the Turf agent can call (env names per Pi provider docs).
 const TURF_PROVIDERS = [
-  { label: 'Google Gemini Studio (FREE tier - 1,000,000 TPM - Recommended: Gemini 2.5 Flash)', env: 'GEMINI_API_KEY' },
+  { label: 'DeepSeek (Recommended — DeepSeek V4 Flash / Pro Flagship Coder)', env: 'DEEPSEEK_API_KEY' },
   { label: 'Groq (FREE tier - 20,000 TPM)', env: 'GROQ_API_KEY' },
   { label: 'Anthropic (Claude 3.7 / 3.5)', env: 'ANTHROPIC_API_KEY' },
   { label: 'OpenAI (GPT-4o, o3-mini)', env: 'OPENAI_API_KEY' },
-  { label: 'DeepSeek', env: 'DEEPSEEK_API_KEY' },
+  { label: 'Google Gemini Studio', env: 'GEMINI_API_KEY' },
   { label: 'OpenRouter', env: 'OPENROUTER_API_KEY' },
   { label: 'Cerebras (free tier)', env: 'CEREBRAS_API_KEY' }
 ];
