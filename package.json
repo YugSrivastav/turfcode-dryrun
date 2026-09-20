@@ -20,6 +20,7 @@
     "start": "node server/index.js",
     "turf": "node bin/turf.js",
     "demo": "node demo/run-demo.js",
+    "showcase": "node demo/dual-terminal-showcase.js",
     "test": "node test/e2e-test.js",
     "build:client": "npm --prefix client run build"
   },

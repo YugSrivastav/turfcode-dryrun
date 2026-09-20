@@ -44,37 +44,66 @@ const env = {
   TURF_HOOK: HOOK
 };
 
-const args = [...process.argv.slice(2)];
-if (fs.existsSync(EXT) && !args.includes('--no-extensions')) args.push('-e', EXT);
+const rawArgs = process.argv.slice(2);
+const optionsWithValues = new Set([
+  '--mode', '-c', '--session', '--model', '-m', '--thinking',
+  '--tools', '-t', '--exclude-tools', '-xt', '--extension', '-e',
+  '--skill', '--prompt-template', '-np', '--theme', '--use-theme',
+  '--export', '--provider'
+]);
+
+const parsedFlags = [];
+const positionalPrompts = [];
+
+for (let i = 0; i < rawArgs.length; i++) {
+  const arg = rawArgs[i];
+  if (arg === '--') {
+    positionalPrompts.push(...rawArgs.slice(i + 1));
+    break;
+  }
+  if (arg.startsWith('-')) {
+    parsedFlags.push(arg);
+    if (!arg.includes('=') && optionsWithValues.has(arg) && i + 1 < rawArgs.length && !rawArgs[i + 1].startsWith('-')) {
+      parsedFlags.push(rawArgs[++i]);
+    }
+  } else {
+    positionalPrompts.push(arg);
+  }
+}
+
+if (fs.existsSync(EXT) && !parsedFlags.includes('--no-extensions') && !parsedFlags.includes('-ne')) {
+  parsedFlags.push('-e', EXT);
+}
 
 // Optimize token usage on free tiers by avoiding unnecessary reasoning bloat
-if (!args.includes('--thinking') && !args.some(a => a.startsWith('--thinking='))) {
-  args.push('--thinking', 'off');
+if (!parsedFlags.includes('--thinking') && !parsedFlags.some(a => a.startsWith('--thinking='))) {
+  parsedFlags.push('--thinking', 'off');
 }
 
 // Ensure non-interactive execution flag (-p) when prompt or --mode is provided
-// Without -p, Pi blocks waiting for interactive TTY stdin.
+const args = parsedFlags;
 const hasPrint = args.includes('-p') || args.includes('--print');
 const isModeJson = args.includes('--mode') && args[args.indexOf('--mode') + 1] === 'json';
-const hasPositionalPrompt = args.some(a => !a.startsWith('-'));
+const hasPositionalPrompt = positionalPrompts.length > 0;
 
 if (!hasPrint && (isModeJson || hasPositionalPrompt)) {
   args.unshift('-p');
 }
 
 // Auto-configure provider if not explicitly given
-if (!args.includes('--provider') && !args.some(a => a.startsWith('--provider='))) {
-  if (env.DEEPSEEK_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
-    args.push('--provider', 'deepseek', '--model', 'deepseek-v4-flash');
-  } else if (env.GROQ_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
-    args.push('--provider', 'groq', '--model', 'llama-3.3-70b-versatile');
-  } else if (env.OPENAI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
-    args.push('--provider', 'openai', '--model', 'gpt-4o');
-  } else if (env.GEMINI_API_KEY && !args.includes('--model') && !args.some(a => a.startsWith('--model='))) {
-    args.push('--provider', 'google', '--model', 'gemini-2.0-flash');
+if (!parsedFlags.includes('--provider') && !parsedFlags.some(a => a.startsWith('--provider='))) {
+  if (env.DEEPSEEK_API_KEY && !parsedFlags.includes('--model') && !parsedFlags.some(a => a.startsWith('--model='))) {
+    parsedFlags.push('--provider', 'deepseek', '--model', 'deepseek-v4-flash');
+  } else if (env.GROQ_API_KEY && !parsedFlags.includes('--model') && !parsedFlags.some(a => a.startsWith('--model='))) {
+    parsedFlags.push('--provider', 'groq', '--model', 'llama-3.3-70b-versatile');
+  } else if (env.OPENAI_API_KEY && !parsedFlags.includes('--model') && !parsedFlags.some(a => a.startsWith('--model='))) {
+    parsedFlags.push('--provider', 'openai', '--model', 'gpt-4o');
+  } else if (env.GEMINI_API_KEY && !parsedFlags.includes('--model') && !parsedFlags.some(a => a.startsWith('--model='))) {
+    parsedFlags.push('--provider', 'google', '--model', 'gemini-2.0-flash');
   }
 }
 
-const res = spawnSync(process.execPath, [PI_CLI, ...args], { stdio: 'inherit', env });
+const finalArgs = [...parsedFlags, ...positionalPrompts];
+const res = spawnSync(process.execPath, [PI_CLI, ...finalArgs], { stdio: 'inherit', env });
 process.exit(res.status ?? 1);
 
