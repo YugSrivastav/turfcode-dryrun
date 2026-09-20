@@ -1530,13 +1530,19 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     left: 0,
     width: '100%',
     bottom: 3,
-    label: ' {bold}{blue-fg}[TEAM CHAT]{/blue-fg}{/bold} ',
+    label: ' {bold}{blue-fg}[TEAM CHAT]{/blue-fg}{/bold} {grey-fg}(↑/↓/PgUp/Dn to scroll){/grey-fg} ',
     border: { type: 'line', fg: 'blue' },
     scrollable: true,
-    alwaysScroll: true,
+    alwaysScroll: false,
     tags: true,
     keys: true,
-    mouse: true
+    vi: true,
+    mouse: true,
+    scrollbar: {
+      ch: '│',
+      track: { bg: 'black' },
+      style: { bg: 'blue' }
+    }
   });
   chatLogBox.log(` {grey-fg}Room ${roomCode} ready. Type /chat to talk.{/grey-fg}`);
 
@@ -2224,10 +2230,10 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
     if (!isFilesFocus) {
       const isPageUp = key.name === 'pageup' || ch === '\x1b[5~';
       const isPageDown = key.name === 'pagedown' || ch === '\x1b[6~';
-      const isUpScroll = (key.shift && key.name === 'up') || (key.ctrl && key.name === 'up') || (key.ctrl && (key.name === 'y' || ch === '\x19')) || (focusIndex === 0 && key.name === 'up' && !(terminalInput.value || '').trim());
-      const isDownScroll = (key.shift && key.name === 'down') || (key.ctrl && key.name === 'down') || (key.ctrl && (key.name === 'd' || ch === '\x04')) || (focusIndex === 0 && key.name === 'down' && !(terminalInput.value || '').trim());
-      const isHome = (key.shift && key.name === 'home');
-      const isEnd = (key.shift && key.name === 'end');
+      const isUpScroll = (key.shift && key.name === 'up') || (key.ctrl && key.name === 'up') || (key.ctrl && (key.name === 'y' || ch === '\x19')) || (focusIndex === 0 && key.name === 'up' && !(terminalInput.value || '').trim()) || (focusIndex === 1 && key.name === 'up' && !(chatInput.value || '').trim());
+      const isDownScroll = (key.shift && key.name === 'down') || (key.ctrl && key.name === 'down') || (key.ctrl && (key.name === 'd' || ch === '\x04')) || (focusIndex === 0 && key.name === 'down' && !(terminalInput.value || '').trim()) || (focusIndex === 1 && key.name === 'down' && !(chatInput.value || '').trim());
+      const isHome = (key.shift && key.name === 'home') || (key.ctrl && key.name === 'home');
+      const isEnd = (key.shift && key.name === 'end') || (key.ctrl && key.name === 'end');
 
       if (isPageUp) {
         const h = focusIndex === 1 ? (chatLogBox.height || 10) : ((getActiveLog() && getActiveLog().height) || 10);
@@ -2240,15 +2246,15 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         return;
       }
       if (isUpScroll) {
-        scrollActiveLog(-3);
+        scrollActiveLog(-2);
         return;
       }
       if (isDownScroll) {
-        scrollActiveLog(3);
+        scrollActiveLog(2);
         return;
       }
       if (isHome) {
-        const log = getActiveLog();
+        const log = focusIndex === 1 ? chatLogBox : getActiveLog();
         if (log && typeof log.setScrollPerc === 'function') {
           log.setScrollPerc(0);
           screen.render();
@@ -2256,7 +2262,7 @@ export function launchTUI({ hostName, roomCode, repoPath, port, localIp, hostAdd
         }
       }
       if (isEnd) {
-        const log = getActiveLog();
+        const log = focusIndex === 1 ? chatLogBox : getActiveLog();
         if (log && typeof log.setScrollPerc === 'function') {
           log.setScrollPerc(100);
           screen.render();

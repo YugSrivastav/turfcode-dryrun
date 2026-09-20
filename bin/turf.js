@@ -129,7 +129,7 @@ let _cachedAgents = null;
 function detectInstalledAgents() {
   if (_cachedAgents) return _cachedAgents;
   _cachedAgents = {
-    agy: isAgentAvailable('agy'),
+    cmdc: isAgentAvailable('cmdc') || isAgentAvailable('command-code'),
     codex: isAgentAvailable('codex')
   };
   return _cachedAgents;
@@ -147,7 +147,7 @@ function printBanner() {
   const agents = detectInstalledAgents();
   const pad = getBlockPad(58);
   console.log(pad + dim('Coding Agents Detected:'));
-  console.log(pad + '  ' + (agents.agy ? accent('●') + ' ' + bright('Antigravity (agy)    ') + accent('[INSTALLED]') : dim('○ Antigravity (agy)    [NOT FOUND]')));
+  console.log(pad + '  ' + (agents.cmdc ? chalk.hex('#D2A8FF')('●') + ' ' + bright('Command Code (cmdc)  ') + chalk.hex('#D2A8FF')('[INSTALLED]') : dim('○ Command Code (cmdc)  [NOT FOUND]')));
   console.log(pad + '  ' + (agents.codex ? chalk.cyan('●') + ' ' + bright('OpenAI Codex (codex) ') + chalk.cyan('[INSTALLED]') : dim('○ OpenAI Codex (codex) [NOT FOUND - fallback available]')));
   console.log('');
   console.log(pad + brandTurf('[1]') + ' ' + bright('Create Turf') + '  ' + dim('— Host a new collaborative session'));
@@ -612,16 +612,36 @@ async function main() {
         } catch (err) {
           if (lastProgressLine) process.stdout.write('\n');
           console.log('\n' + pad + chalk.red('❌ Workspace sync failed:') + ' ' + dim(err.message));
-          console.log(pad + bright('Options:'));
-          console.log(pad + '  ' + brandTurf('[1]') + ' Retry download from host');
-          console.log(pad + '  ' + brandTurf('[2]') + ' Select existing local folder/clone on your PC');
-          console.log(pad + '  ' + brandTurf('[3]') + ' Cancel / Back');
+          if (err.message && (err.message.includes('fetch failed') || err.message.includes('ECONNREFUSED') || err.message.includes('ETIMEDOUT'))) {
+            console.log(pad + chalk.yellow('⚠️  Cannot reach host at http://' + hostIp + ':' + targetPort));
+            console.log(pad + dim('   • Check that the host has Turf running (Create Turf).'));
+            console.log(pad + dim('   • Ensure host IP and port are correct (LAN Wi-Fi IP e.g. 192.168.x.x or 10.x.x.x).'));
+            console.log(pad + dim('   • Verify Windows Firewall on the host is allowing incoming connections on port ' + targetPort + '.'));
+          }
+          console.log('\n' + pad + bright('Options:'));
+          console.log(pad + '  ' + brandTurf('[1]') + ' Retry download from current host');
+          console.log(pad + '  ' + brandTurf('[2]') + ' Change Host IP / port');
+          console.log(pad + '  ' + brandTurf('[3]') + ' Select existing local folder/clone on your PC');
+          console.log(pad + '  ' + brandTurf('[4]') + ' Cancel / Back');
 
-          const failChoice = await prompt(pad + accent('›') + ' ' + bright('Action') + dim(' [1/2/3]: '));
-          if (failChoice === '__BACK__' || failChoice === '3') {
+          const failChoice = await prompt(pad + accent('›') + ' ' + bright('Action') + dim(' [1/2/3/4]: '));
+          if (failChoice === '__BACK__' || failChoice === '4') {
             break;
           }
           if (failChoice === '2') {
+            const newAddress = await prompt(pad + accent('›') + ' ' + bright('Enter Host IP or IP:port') + dim(` [e.g. ${hostIp}:${targetPort}]: `));
+            if (newAddress === '__BACK__') break;
+            let rawAddr = newAddress.trim();
+            if (rawAddr) {
+              if (rawAddr.includes(':')) {
+                const parts = rawAddr.split(':');
+                hostIp = parts[0];
+                targetPort = parseInt(parts[1], 10) || targetPort;
+              } else {
+                hostIp = rawAddr;
+              }
+            }
+          } else if (failChoice === '3') {
             const customPathInput = await prompt(pad + accent('›') + ' ' + bright('Path to local project/repo') + ' ' + dim('[default: .]: '));
             if (customPathInput === '__BACK__') break;
             const chosenPath = await normalizeAndValidatePath(customPathInput, (q) => prompt(q), pad);
