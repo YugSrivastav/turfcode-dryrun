@@ -572,10 +572,10 @@ async function main() {
       
       let syncSuccess = false;
       let peerRepoPath = '';
+      let detectedRoomCode = 'SYNC';
 
       while (!syncSuccess) {
         console.log('\n' + pad + accent('●') + ' ' + dim(`Connecting and synchronizing repository from ${hostIp}:${targetPort}...`));
-        let detectedRoomCode = 'SYNC';
         try {
           const roomRes = await fetch(`http://${hostIp}:${targetPort}/api/room`, { signal: AbortSignal.timeout(5000) });
           if (roomRes.ok) {
